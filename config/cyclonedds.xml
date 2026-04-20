@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<CycloneDDS xmlns="https://cdds.io/config">
+  <Domain>
+    <General>
+      <!--
+        Previously pinned to <NetworkInterfaceAddress>lo</NetworkInterfaceAddress>,
+        which breaks discovery with other host-network ROS2 containers because
+        multicast over the loopback interface is disabled by default on Linux.
+        Let CycloneDDS auto-pick the best interface — host-mode containers share
+        the host stack so discovery goes over the real NIC.
+      -->
+      <AllowMulticast>true</AllowMulticast>
+      <Interfaces>
+        <NetworkInterface autodetermine="true"/>
+      </Interfaces>
+    </General>
+  </Domain>
+</CycloneDDS>

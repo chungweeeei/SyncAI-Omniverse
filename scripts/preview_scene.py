@@ -1,77 +1,67 @@
-#!/usr/bin/env python3
-"""
-Generate warehouse USD locally and open in usdview for preview.
-Does NOT require Isaac Sim — only needs `pip install usd-core pyyaml`.
+"""Generate a warehouse USD scene locally and optionally open in usdview.
 
-Usage:
-    pip install usd-core pyyaml
-    python scripts/preview_scene.py          # generate + open usdview
-    python scripts/preview_scene.py --no-view  # generate only
+Only requires: pip install usd-core pyyaml
+No Isaac Sim dependency.
 """
 
+import argparse
 import os
 import sys
-import argparse
-import subprocess
 
-# Add src/ to path
+# Ensure src/ is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from syncai_omniverse.warehouse_builder import WarehouseBuilder
+import yaml
+from syncai_omniverse.usd.stl_to_usd import stl_to_usd
+from syncai_omniverse.usd.scene import build_combined_scene
 
 
-ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-SCENES_DIR = os.path.join(ROOT_DIR, "scenes")
-SCENE_PATH = os.path.join(SCENES_DIR, "warehouse.usda")
-
-# Default config (same as startup_scene.py)
-DEFAULT_CONFIG = {
-    "ground_size": [8.0, 8.0],
-    "wall_height": 2.0,
-    "wall_thickness": 0.1,
-    "num_shelf_rows": 1,
-    "num_shelf_cols": 2,
-    "shelf_spacing": 2.5,
-    "shelf_height": 1.0,
-    "shelf_width": 0.8,
-    "shelf_depth": 0.3,
-    "num_obstacle_boxes": 2,
-    "box_size_range": [0.2, 0.3],
-}
+def _resolve_stl_path(raw_path: str) -> str:
+    """Resolve an STL path; rewrite container-style /workspace/... to project-relative."""
+    if raw_path.startswith("/workspace/"):
+        return os.path.join(
+            os.path.dirname(__file__), "..",
+            raw_path.replace("/workspace/", ""),
+        )
+    return raw_path
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Preview USD scene locally")
+    parser = argparse.ArgumentParser(description="Preview warehouse scene")
     parser.add_argument("--no-view", action="store_true", help="Generate only, don't open usdview")
+    parser.add_argument("--config", default="config/sim_config.yaml", help="Path to config YAML")
     args = parser.parse_args()
 
-    os.makedirs(SCENES_DIR, exist_ok=True)
+    # Load config
+    config_path = os.path.join(os.path.dirname(__file__), "..", args.config)
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
 
-    # Try loading YAML config
-    config = DEFAULT_CONFIG
-    try:
-        import yaml
-        config_path = os.path.join(ROOT_DIR, "config", "sim_config.yaml")
-        if os.path.exists(config_path):
-            with open(config_path) as f:
-                config = yaml.safe_load(f).get("warehouse", DEFAULT_CONFIG)
-            print(f"Loaded config from {config_path}")
-    except ImportError:
-        print("pyyaml not installed — using default config")
+    output_path = os.path.join(
+        os.path.dirname(__file__), "..",
+        config.get("output", {}).get("scene_path", "scenes/preview.usda"),
+    )
 
-    # Build warehouse
-    print(f"Building warehouse scene -> {SCENE_PATH}")
-    builder = WarehouseBuilder(config, SCENE_PATH)
-    builder.build()
-    print(f"  Done: {SCENE_PATH}")
+    scene_mode = config.get("scene_mode", "stl")
+
+    if scene_mode == "stl":
+        stl_cfg = config["stl"]
+        stl_path = _resolve_stl_path(stl_cfg["file_path"])
+        print(f"Building STL scene from {stl_path}")
+        stl_to_usd(stl_path, output_path, stl_cfg)
+    elif scene_mode == "warehouse_with_robot":
+        stl_path = _resolve_stl_path(config["stl"]["file_path"])
+        print(f"Building warehouse + robot scene from {stl_path}")
+        build_combined_scene(output_path, stl_path, config)
+    else:
+        print(f"Scene mode '{scene_mode}' not yet implemented")
+        sys.exit(1)
+
+    print(f"Scene saved: {output_path}")
 
     if not args.no_view:
-        print(f"\nOpening usdview: {SCENE_PATH}")
-        try:
-            subprocess.run(["usdview", SCENE_PATH])
-        except FileNotFoundError:
-            print("usdview not found. Install with: pip install usd-core")
-            print(f"You can also open the file manually: {SCENE_PATH}")
+        import subprocess
+        subprocess.run(["usdview", output_path])
 
 
 if __name__ == "__main__":

@@ -1,62 +1,49 @@
 services:
   isaac-sim:
     image: nvcr.io/nvidia/isaac-sim:5.1.0
-    runtime: nvidia
-    environment:
-      - DISPLAY=${DISPLAY}
-      - ACCEPT_EULA=Y
-      # Vulkan ICD (NVIDIA GPU rendering)
-      - VK_ICD_FILENAMES=/etc/vulkan/icd.d/nvidia_icd.json
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=all
-      # ROS2 DDS communication
-      - ROS_DOMAIN_ID=0
-      - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
     container_name: isaac-sim
     entrypoint: bash
-    command: >-
-      -c "./isaac-sim.sh --exec /startup/startup_scene.py"
-    volumes:
-      # X11 socket (for headless virtual display)
-      - /tmp/.X11-unix:/tmp/.X11-unix:rw
-      # GPU device nodes
-      - /dev/dri:/dev/dri
-      # Persistent cache & data (avoid re-downloading shaders each run)
-      - isaac-sim-cache-kit:/isaac-sim/kit/cache
-      - isaac-sim-cache-ov:/home/ubuntu/.cache/ov
-      - isaac-sim-cache-pip:/home/ubuntu/.cache/pip
-      - isaac-sim-cache-glcache:/home/ubuntu/.cache/nvidia/GLCache
-      - isaac-sim-cache-computecache:/home/ubuntu/.nv/ComputeCache
-      - isaac-sim-logs:/home/ubuntu/.nvidia-omniverse/logs
-      - isaac-sim-data:/home/ubuntu/.local/share/ov/data
-      - isaac-sim-documents:/home/ubuntu/Documents
-      # Project files
-      - ./startup_scene.py:/startup/startup_scene.py:ro
-      - ./src:/workspace/src:ro
-      - ./config:/workspace/config:ro
-      # Building floor plan STL
-      - ./models/dp1f:/workspace/models/dp1f:ro
-    network_mode: host
-    ipc: host
-    shm_size: '4gb'
-    privileged: true
     stdin_open: true
     tty: true
-
+    network_mode: host
+    runtime: nvidia
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
               count: all
-              capabilities: [gpu, compute, utility, graphics, display]
-
-volumes:
-  isaac-sim-cache-kit:
-  isaac-sim-cache-ov:
-  isaac-sim-cache-pip:
-  isaac-sim-cache-glcache:
-  isaac-sim-cache-computecache:
-  isaac-sim-logs:
-  isaac-sim-data:
-  isaac-sim-documents:
+              capabilities: [gpu]
+    environment:
+      ACCEPT_EULA: "Y"
+      PRIVACY_CONSENT: "Y"
+      OMNI_KIT_ACCEPT_EULA: "YES"
+      DISPLAY: ${DISPLAY:-:0}
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: all
+      XAUTHORITY: /tmp/.Xauthority
+      # ROS2 / CycloneDDS — Isaac Sim ships its own ROS2 Jazzy under
+      # /isaac-sim/exts/isaacsim.ros2.bridge/jazzy/lib; put it on LD_LIBRARY_PATH so
+      # the bridge extension can dlopen rmw + ament libs.
+      RMW_IMPLEMENTATION: rmw_cyclonedds_cpp
+      CYCLONEDDS_URI: /workspace/config/cyclonedds.xml
+      ROS_DISTRO: jazzy
+      LD_LIBRARY_PATH: /isaac-sim/exts/isaacsim.ros2.bridge/jazzy/lib
+    volumes:
+      # X11 passthrough for usdview / Kit UI
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ${XAUTHORITY:-$HOME/.Xauthority}:/tmp/.Xauthority:rw
+      # Project source / assets / scenes
+      - ./:/workspace:rw
+      # Isaac Sim caches — bind mounts under ./.isaac-cache so the container UID (1234)
+      # can write to them. Named volumes inherit root-ownership from the image and break
+      # the RTX shader cache / ogn_generated / material_cache. Paths mirror HOME=/isaac-sim.
+      - ./.isaac-cache/kit:/isaac-sim/kit/cache:rw
+      # Mount the whole /isaac-sim/.cache so subdirs Isaac Sim creates on demand
+      # (warp, ov, pip, nvidia/GLCache, …) all land on a writable bind.
+      - ./.isaac-cache/cache:/isaac-sim/.cache:rw
+      - ./.isaac-cache/compute:/isaac-sim/.nv/ComputeCache:rw
+      - ./.isaac-cache/logs:/isaac-sim/.nvidia-omniverse/logs:rw
+      - ./.isaac-cache/data:/isaac-sim/.local/share/ov/data:rw
+      - ./.isaac-cache/documents:/isaac-sim/Documents:rw
+    working_dir: /workspace

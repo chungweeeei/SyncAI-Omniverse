@@ -3,6 +3,9 @@ scenes/*.usd
 scenes/*.usda
 scenes/*.usdc
 
+# Virtual environment
+.venv/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -21,3 +24,7 @@ Thumbs.db
 
 # Logs
 *.log
+logs/
+
+# Isaac Sim cache bind mounts
+.isaac-cache/

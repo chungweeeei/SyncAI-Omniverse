@@ -1,49 +1,26 @@
 # SyncAI-Omniverse
 
-Warehouse simulation with a Jetbot AMR on NVIDIA Isaac Sim 5.1.
-
-## Prerequisites
-
-- NVIDIA Isaac Sim 5.1
-- GPU with RTX support
-- Nucleus server access (for built-in Jetbot asset)
+Warehouse simulation with a TurtleBot3 AMR on NVIDIA Isaac Sim 5.1.
 
 ## Project Structure
 
 ```
-config/sim_config.yaml        — Tunable parameters (scene size, robot speed, etc.)
-scripts/create_warehouse_scene.py  — Generate warehouse USD (headless)
-scripts/run_simulation.py     — Launch simulation with keyboard-controlled Jetbot
-src/syncai_omniverse/          — Reusable library modules
+assets/models/dp1f/       -- Real floor plan STL
+config/                   -- Simulation config (sim_config.yaml)
+src/syncai_omniverse/usd/ -- USD scene builders (pure pxr, no Isaac Sim)
+scripts/                  -- CLI entry points
+scenes/                   -- Generated USD output (gitignored)
 ```
 
-## Usage
+## Quick Start
 
-Use Isaac Sim's bundled Python to run the scripts:
+Generate a USD scene from the floor plan STL (no Isaac Sim required):
 
 ```bash
-# Generate the warehouse scene
-python.sh scripts/create_warehouse_scene.py
-
-# Run the simulation
-python.sh scripts/run_simulation.py
+pip install usd-core pyyaml
+python scripts/preview_scene.py --no-view
 ```
-
-`run_simulation.py` will auto-generate the scene if it doesn't exist yet.
-
-## Controls
-
-| Key | Action |
-|-----|--------|
-| W / Up Arrow | Forward |
-| S / Down Arrow | Backward |
-| A / Left Arrow | Turn left |
-| D / Right Arrow | Turn right |
 
 ## Configuration
 
-Edit `config/sim_config.yaml` to adjust:
-
-- `warehouse` — Ground size, wall height, shelf layout, obstacle count
-- `jetbot` — Spawn position, max speeds
-- `simulation` — Physics and rendering timestep
+Edit `config/sim_config.yaml` to switch scene modes and adjust parameters.
