@@ -1,0 +1,36 @@
+simulation:
+  headless: false
+  physics_dt: 0.016667   # 1/60
+  rendering_dt: 0.016667
+
+scene_mode: "stl"   # "warehouse" or "stl"
+
+stl:
+  file_path: "/workspace/models/dp1f/dp1f.stl"
+  scale: 0.1
+  center_xy: true
+  ground_plane_size: [20.0, 30.0]
+
+warehouse:
+  ground_size: [8.0, 8.0]
+  wall_height: 2.0
+  wall_thickness: 0.1
+  num_shelf_rows: 1
+  num_shelf_cols: 2
+  shelf_spacing: 2.5
+  shelf_height: 1.0
+  shelf_width: 0.8
+  shelf_depth: 0.3
+  num_obstacle_boxes: 2
+  box_size_range: [0.2, 0.3]
+
+robot:
+  model: "turtlebot3_burger"
+  spawn_position: [0.0, 0.0, 0.05]
+  wheel_radius: 0.033
+  wheel_base: 0.160           # wheel separation
+  max_linear_speed: 0.22      # m/s
+  max_angular_speed: 2.84     # rad/s
+
+output:
+  scene_path: "scenes/warehouse.usda"
