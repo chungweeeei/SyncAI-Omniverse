@@ -99,6 +99,7 @@ def attach_lidar_publisher(
                 ("LidarHelper.inputs:topicName", topic),
                 ("LidarHelper.inputs:frameId", frame_id),
                 ("LidarHelper.inputs:type", publish_type),
+                ("LidarHelper.inputs:fullScan", True),
             ],
         },
     )
