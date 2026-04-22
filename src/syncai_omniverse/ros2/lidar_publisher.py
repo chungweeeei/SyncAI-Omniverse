@@ -12,6 +12,11 @@ before calling `attach_lidar_publisher`.
 """
 from pxr import Sdf
 
+from syncai_omniverse.ros2._ns import (
+    apply_frame_namespace as _apply_frame_namespace,
+    apply_namespace as _apply_namespace,
+)
+
 
 def attach_lidar_publisher(
     stage,
@@ -21,7 +26,8 @@ def attach_lidar_publisher(
     config: str = "SICK_picoScan150",
     topic: str = "/scan",
     frame_id: str = "lidar_link",
-    publish_type: str = "laser_scan",
+    publish_type: str = "auto",
+    namespace: str = "",
     graph_path: str = "/LidarActionGraph",
 ) -> str:
     """
@@ -31,15 +37,23 @@ def attach_lidar_publisher(
         to `topic`.
 
         `config` must match a stem in SUPPORTED_LIDAR_CONFIGS (e.g.
-        "SICK_picoScan150", "SICK_TIM781", "RPLIDAR_S2E"); the vendor folder
-        prefix is NOT used.
+        "SICK_picoScan150", "SICK_tim781", "SICK_multiScan165"); the vendor
+        folder prefix is NOT used.
 
-        `publish_type` must be "laser_scan" or "point_cloud".
+        `publish_type` is "laser_scan", "point_cloud", or "auto". "auto" reads
+        the config JSON's elevation range and picks `laser_scan` only for true
+        2D configs (elevation=[0,0]); anything else (e.g. SICK_multiScan165
+        with elevation [-7.2, +34.3]) publishes as `point_cloud`, because the
+        ROS2RtxLidarHelper laser_scan mode rejects sensors with non-zero
+        elevation.
 
         Returns the graph prim path.
     """
     import omni.graph.core as og
     import omni.kit.commands
+
+    if publish_type == "auto":
+        publish_type = _pick_publish_type(config)
 
     parent_path = f"{robot_path}/{lidar_link}"
     if not stage.GetPrimAtPath(parent_path).IsValid():
@@ -63,6 +77,8 @@ def attach_lidar_publisher(
             "assets root is reachable."
         )
     lidar_prim_path = str(sensor.GetPath())
+    topic = _apply_namespace(namespace, topic)
+    frame_id = _apply_frame_namespace(namespace, frame_id)
     print(f"[lidar] created RTX sensor prim at {lidar_prim_path}")
 
     og.Controller.edit(
@@ -90,3 +106,33 @@ def attach_lidar_publisher(
     print(f"[lidar] graph={graph_path}  topic={topic}  type={publish_type}  frame={frame_id}")
     print(f"[lidar]   sensor prim={lidar_prim_path}  config={config}")
     return graph_path
+
+
+def _pick_publish_type(config: str) -> str:
+    """Peek at the shipped lidar JSON to decide laser_scan vs point_cloud.
+    Defaults to `point_cloud` if the config can't be located (safer — the
+    laser_scan node asserts elevation=0 and silently drops frames otherwise).
+    """
+    import glob
+    import json
+    import os
+
+    roots = [
+        "/isaac-sim/exts/isaacsim.sensors.rtx/data/lidar_configs",
+        os.environ.get("ISAAC_PATH", ""),
+    ]
+    for root in roots:
+        if not root:
+            continue
+        for path in glob.glob(os.path.join(root, "**", f"{config}.json"),
+                              recursive=True):
+            try:
+                profile = json.load(open(path)).get("profile", {})
+                up = profile.get("upElevationDeg", 0) or 0
+                dn = profile.get("downElevationDeg", 0) or 0
+                if abs(up) < 1e-6 and abs(dn) < 1e-6:
+                    return "laser_scan"
+                return "point_cloud"
+            except Exception:
+                pass
+    return "point_cloud"

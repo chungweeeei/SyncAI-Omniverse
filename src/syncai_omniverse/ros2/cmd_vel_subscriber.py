@@ -20,7 +20,12 @@ Why on-demand + OnPhysicsStep:
 
 Requires Isaac Sim runtime; do not import before `SimulationApp` is up.
 """
-from pxr import Sdf
+from pxr import Sdf, Usd, UsdPhysics
+
+from syncai_omniverse.ros2._ns import (
+    apply_namespace as _apply_namespace,
+    find_articulation_root as _find_articulation_root,
+)
 
 
 def attach_cmd_vel_subscriber(
@@ -37,7 +42,30 @@ def attach_cmd_vel_subscriber(
     max_linear_speed: float = 0.0,
     max_angular_speed: float = 0.0,
     max_wheel_speed: float = 0.0,
+    # Acceleration limits ramp DiffCtrl's velocityCommand so wheel drive
+    # doesn't see an instantaneous step on cmd_vel change. Units m/s^2,
+    # rad/s^2. 0.0 = unlimited. DiffCtrl reads `dt` wired to
+    # `OnPhysicsStep.outputs:deltaSimulationTime` so ramping advances by
+    # the real physics substep.
+    #
+    # Tuned to be slightly LOOSER than nav2's velocity_smoother defaults
+    # (max_accel=[2.5, 0, 1.5], max_decel=[-2.5, 0, -1.5]) so our rate
+    # limiter never bottlenecks nav2's close-loop near-goal corrections
+    # (e.g. `RegulatedPurePursuit` + `use_rotate_to_heading=True` sends
+    # fast-tapering angular vel to finish yaw within yaw_goal_tolerance).
+    # Physical smoothing still happens via wheel drive (maxForce=8 N·m)
+    # and base_link linear/angular damping.
+    max_linear_accel: float = 2.5,
+    max_linear_decel: float = 2.5,
+    max_angular_accel: float = 2.0,
+    # Defaults match `slot_car.py::_revolute_joint`; we re-apply so stages
+    # authored with stale values still get the intended gains. Lowered from
+    # the original (2000/15) to smooth the wheel drive response — see the
+    # block comment inside `_revolute_joint` for the force-budget math.
+    wheel_drive_damping: float = 200.0,
+    wheel_drive_max_force: float = 8.0,
     topic: str = "/cmd_vel",
+    namespace: str = "",
     graph_path: str = "/CmdVelActionGraph",
     debug: bool = False,
 ) -> str:
@@ -52,12 +80,42 @@ def attach_cmd_vel_subscriber(
     import omni.graph.core as og
 
     # -- Pre-flight validation --
+    # IsaacArticulationController resolves drive joints by name from the
+    # articulation root, so we don't need the joint's absolute prim path --
+    # just confirm a RevoluteJoint with each name exists somewhere under
+    # robot_path. The old check assumed a `{robot_path}/joints/{name}` layout
+    # that only the procedural SlotCar authored; the TurtleBot3 reference has
+    # joints scattered under various link prims.
     robot_prim = stage.GetPrimAtPath(robot_path)
     if not robot_prim.IsValid():
         raise RuntimeError(f"Robot prim not found: {robot_path}")
-    for jname in (left_joint, right_joint):
-        if not stage.GetPrimAtPath(f"{robot_path}/joints/{jname}").IsValid():
-            raise RuntimeError(f"Joint not found: {robot_path}/joints/{jname}")
+
+    required = {left_joint, right_joint}
+    wheel_joint_prims = []
+    for p in Usd.PrimRange(robot_prim):
+        if p.IsA(UsdPhysics.RevoluteJoint) and p.GetName() in required:
+            wheel_joint_prims.append(p)
+    found = {p.GetName() for p in wheel_joint_prims}
+    missing = required - found
+    if missing:
+        raise RuntimeError(
+            f"Drive joints not found under {robot_path}: {sorted(missing)}. "
+            f"Check the articulation's joint names."
+        )
+
+    # Patch wheel drive gains (see `wheel_drive_*` docstrings above).
+    for jp in wheel_joint_prims:
+        drive = UsdPhysics.DriveAPI.Get(jp, "angular")
+        if drive:
+            prior_d = drive.GetDampingAttr().Get()
+            prior_f = drive.GetMaxForceAttr().Get()
+            drive.GetDampingAttr().Set(wheel_drive_damping)
+            drive.GetMaxForceAttr().Set(wheel_drive_max_force)
+            # Make sure stiffness is zero so we're in pure velocity mode.
+            drive.GetStiffnessAttr().Set(0.0)
+            print(f"[cmd_vel]   patched {jp.GetName()}: "
+                  f"damping {prior_d}->{wheel_drive_damping}  "
+                  f"maxForce {prior_f:.1e}->{wheel_drive_max_force}")
 
     create_nodes = [
         ("OnPhysics", "isaacsim.core.nodes.OnPhysicsStep"),
@@ -79,8 +137,18 @@ def attach_cmd_vel_subscriber(
         ("SubTwist.outputs:angularVelocity", "BreakAngular.inputs:tuple"),
         ("BreakLinear.outputs:x", "DiffCtrl.inputs:linearVelocity"),
         ("BreakAngular.outputs:z", "DiffCtrl.inputs:angularVelocity"),
+        # Feed physics substep size into DiffCtrl so its internal acceleration
+        # limiter can ramp the wheel velocity command correctly. Without this
+        # `dt` stays 0 and max{Linear,Angular}Acceleration are no-ops.
+        ("OnPhysics.outputs:deltaSimulationTime", "DiffCtrl.inputs:dt"),
         ("DiffCtrl.outputs:velocityCommand", "ArtCtrl.inputs:velocityCommand"),
     ]
+    topic = _apply_namespace(namespace, topic)
+    # IsaacArticulationController.targetPrim must resolve to the prim that
+    # carries ArticulationRootAPI (the floating-base root RigidBody), not the
+    # wrapping Xform. Passing a non-rigid ancestor fails with "Pattern ...
+    # did not match any rigid bodies" once the node tries to bind its view.
+    art_root_path = _find_articulation_root(stage, robot_path)
     set_values = [
         ("SubTwist.inputs:topicName", topic),
         ("DiffCtrl.inputs:wheelRadius", wheel_radius),
@@ -88,7 +156,10 @@ def attach_cmd_vel_subscriber(
         ("DiffCtrl.inputs:maxLinearSpeed", max_linear_speed),
         ("DiffCtrl.inputs:maxAngularSpeed", max_angular_speed),
         ("DiffCtrl.inputs:maxWheelSpeed", max_wheel_speed),
-        ("ArtCtrl.inputs:targetPrim", [Sdf.Path(robot_path)]),
+        ("DiffCtrl.inputs:maxAcceleration", max_linear_accel),
+        ("DiffCtrl.inputs:maxDeceleration", max_linear_decel),
+        ("DiffCtrl.inputs:maxAngularAcceleration", max_angular_accel),
+        ("ArtCtrl.inputs:targetPrim", [Sdf.Path(art_root_path)]),
         ("ArtCtrl.inputs:jointNames", [left_joint, right_joint]),
     ]
 
@@ -115,6 +186,10 @@ def attach_cmd_vel_subscriber(
     print(f"[cmd_vel]   maxLinearSpeed={max_linear_speed} (0=unlimited)  "
           f"maxAngularSpeed={max_angular_speed} (0=unlimited)  "
           f"maxWheelSpeed={max_wheel_speed} (0=unlimited)")
+    print(f"[cmd_vel]   maxLinearAccel={max_linear_accel} m/s^2  "
+          f"maxLinearDecel={max_linear_decel} m/s^2  "
+          f"maxAngularAccel={max_angular_accel} rad/s^2  (0=unlimited, "
+          f"dt from OnPhysicsStep.deltaSimulationTime)")
 
     if debug:
         print(f"[cmd_vel][debug] nodes:")

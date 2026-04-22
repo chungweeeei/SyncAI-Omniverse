@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import yaml
 from syncai_omniverse.usd.stl_to_usd import stl_to_usd
-from syncai_omniverse.usd.scene import build_combined_scene
+from syncai_omniverse.usd.scene import build_combined_scene, build_robot_only_scene
 
 
 def _resolve_stl_path(raw_path: str) -> str:
@@ -53,6 +53,9 @@ def main():
         stl_path = _resolve_stl_path(config["stl"]["file_path"])
         print(f"Building warehouse + robot scene from {stl_path}")
         build_combined_scene(output_path, stl_path, config)
+    elif scene_mode == "robot_only":
+        print(f"Building robot-only diagnostic scene (no warehouse)")
+        build_robot_only_scene(output_path, config)
     else:
         print(f"Scene mode '{scene_mode}' not yet implemented")
         sys.exit(1)

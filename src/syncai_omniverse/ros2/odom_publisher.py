@@ -7,6 +7,12 @@ Do NOT import this module before `SimulationApp` is instantiated.
 """
 from pxr import Sdf
 
+from syncai_omniverse.ros2._ns import (
+    apply_frame_namespace as _apply_frame_namespace,
+    apply_namespace as _apply_namespace,
+    find_articulation_root as _find_articulation_root,
+)
+
 
 def attach_odom_publisher(
     stage,
@@ -16,6 +22,7 @@ def attach_odom_publisher(
     odom_topic: str = "/odom",
     tf_topic: str = "/tf",
     joint_state_topic: str = "/joint_states",
+    namespace: str = "",
     graph_path: str = "/OdomActionGraph",
     publish_joint_states: bool = True,
 ) -> str:
@@ -63,14 +70,23 @@ def attach_odom_publisher(
         ("ComputeOdom.outputs:position", "PublishOdomTF.inputs:translation"),
         ("ComputeOdom.outputs:orientation", "PublishOdomTF.inputs:rotation"),
     ]
+    # Namespace the data topics; leave /tf global so the TF tree is still
+    # discoverable by nav2 / rviz without extra remapping. Frame ids follow
+    # the tf_prefix convention (`<ns>/odom`, `<ns>/base_link`) so multi-robot
+    # TF trees don't collide on the shared /tf topic.
+    odom_topic = _apply_namespace(namespace, odom_topic)
+    joint_state_topic = _apply_namespace(namespace, joint_state_topic)
+    odom_frame_id = _apply_frame_namespace(namespace, odom_frame)
+    chassis_frame_id = _apply_frame_namespace(namespace, chassis_link)
+
     set_values = [
         ("ComputeOdom.inputs:chassisPrim", [Sdf.Path(chassis_path)]),
         ("PublishOdom.inputs:topicName", odom_topic),
-        ("PublishOdom.inputs:odomFrameId", odom_frame),
-        ("PublishOdom.inputs:chassisFrameId", chassis_link),
+        ("PublishOdom.inputs:odomFrameId", odom_frame_id),
+        ("PublishOdom.inputs:chassisFrameId", chassis_frame_id),
         ("PublishOdomTF.inputs:topicName", tf_topic),
-        ("PublishOdomTF.inputs:parentFrameId", odom_frame),
-        ("PublishOdomTF.inputs:childFrameId", chassis_link),
+        ("PublishOdomTF.inputs:parentFrameId", odom_frame_id),
+        ("PublishOdomTF.inputs:childFrameId", chassis_frame_id),
     ]
 
     if publish_joint_states:
@@ -81,9 +97,13 @@ def attach_odom_publisher(
             ("OnTick.outputs:tick", "PublishJointState.inputs:execIn"),
             ("ReadSimTime.outputs:simulationTime", "PublishJointState.inputs:timeStamp"),
         ])
+        # ROS2PublishJointState.targetPrim must resolve to the articulation
+        # root RigidBody; pointing it at the wrapping Xform fails with
+        # "Pattern ... did not match any rigid bodies".
+        art_root_path = _find_articulation_root(stage, robot_path)
         set_values.extend([
             ("PublishJointState.inputs:topicName", joint_state_topic),
-            ("PublishJointState.inputs:targetPrim", [Sdf.Path(robot_path)]),
+            ("PublishJointState.inputs:targetPrim", [Sdf.Path(art_root_path)]),
         ])
 
     og.Controller.edit(

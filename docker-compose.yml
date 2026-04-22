@@ -1,7 +1,7 @@
 services:
   isaac-sim:
     image: nvcr.io/nvidia/isaac-sim:5.1.0
-    container_name: isaac-sim
+    container_name: syncai-simulation
     entrypoint: bash
     stdin_open: true
     tty: true
