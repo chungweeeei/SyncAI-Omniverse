@@ -29,6 +29,7 @@ def attach_lidar_publisher(
     publish_type: str = "auto",
     namespace: str = "",
     graph_path: str = "/LidarActionGraph",
+    debug_draw: bool = True,
 ) -> str:
     """
         Spawn an RTX lidar at `{robot_path}/{lidar_link}/{lidar_name}` using the
@@ -106,7 +107,45 @@ def attach_lidar_publisher(
 
     print(f"[lidar] graph={graph_path}  topic={topic}  type={publish_type}  frame={frame_id}")
     print(f"[lidar]   sensor prim={lidar_prim_path}  config={config}")
+
+    if debug_draw:
+        attach_lidar_debug_draw(lidar_prim_path)
+
     return graph_path
+
+
+def attach_lidar_debug_draw(
+    lidar_prim_path: str,
+    color=(1.0, 0.0, 0.0, 1.0),
+    size: float = 0.05,
+) -> None:
+    """Paint each RTX lidar return as a coloured point in the Isaac Sim viewport.
+
+    Uses the non-accumulating writer (`RtxLidarDebugDrawPointCloud`, no
+    `Buffer` suffix). Each viewport frame shows only the rays emitted during
+    that tick, so the points stay in sync with the lidar's current pose --
+    no motion smear while the robot drives. The tradeoff is a ~10 Hz flicker
+    when the robot is stationary, because most viewport frames fall between
+    rotations and have no new returns to draw.
+
+    The buffered variant (`...Buffer`) trades this the other way: stable when
+    still, smeared trails when moving, because it draws a full rotation's
+    worth of points using the latest transform regardless of when each ray
+    was shot. User picked no-smear; keep this variant.
+
+    `color` (RGBA 0-1) and `size` are forwarded to the underlying
+    `isaacsim.util.debug_draw.DebugDrawPointCloud` node.
+    """
+    import omni.replicator.core as rep
+
+    render_product = rep.create.render_product(
+        lidar_prim_path, [1, 1], name="IsaacLidarViz"
+    )
+    writer = rep.writers.get("RtxLidarDebugDrawPointCloud")
+    writer.initialize(color=list(color), size=size)
+    writer.attach([render_product])
+    print(f"[lidar] debug-draw attached to {lidar_prim_path} "
+          f"(per-frame, color={tuple(color)}, size={size})")
 
 
 def _pick_publish_type(config: str) -> str:
