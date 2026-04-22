@@ -48,8 +48,11 @@ def build_warehouse(stage: Usd.Stage, stl_path: str, config: dict) -> None:
     gx, gy = ground_size
     ground_cube = UsdGeom.Cube.Define(stage, "/World/GroundPlane/Mesh")
     ground_cube.CreateSizeAttr(1.0)
-    ground_cube.AddScaleOp().Set(Gf.Vec3f(gx, gy, 0.02))
+    # Translate before Scale so the offset isn't composed through the scale
+    # and the 0.02m slab truly centers on z=-0.01 (top at z=0). The inverse
+    # order hid a ~+0.01m ledge under scenes built with this helper.
     ground_cube.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, -0.01))
+    ground_cube.AddScaleOp().Set(Gf.Vec3f(gx, gy, 0.02))
     UsdPhysics.CollisionAPI.Apply(ground_cube.GetPrim())
 
     ground_phys_mat = UsdShade.Material.Define(

@@ -12,4 +12,4 @@ robot:
   spawn_position: [0.0, 0.0, 0.15]
 
 output:
-  scene_path: "scenes/warehouse.usda"
+  scene_path: "scenes/dp1f_slotcar.usda"
