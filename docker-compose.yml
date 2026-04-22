@@ -5,7 +5,8 @@ services:
     entrypoint: bash
     stdin_open: true
     tty: true
-    network_mode: host
+    networks:
+      - syncai-network
     runtime: nvidia
     deploy:
       resources:
@@ -47,3 +48,8 @@ services:
       - ./.isaac-cache/data:/isaac-sim/.local/share/ov/data:rw
       - ./.isaac-cache/documents:/isaac-sim/Documents:rw
     working_dir: /workspace
+
+networks:
+  syncai-network:
+    external: true
+    name: syncai-network
