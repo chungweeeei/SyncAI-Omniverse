@@ -4,23 +4,43 @@ from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics, UsdShade
 
 from syncai_omniverse.usd.stl_to_usd import build_warehouse
 from syncai_omniverse.usd.slot_car import build_slotcar
+from syncai_omniverse.usd.mir_amr import build_mir_amr
+
+
+# Registry of available robot model builders. `robot.model` in sim_config.yaml
+# selects which one runs. Add entries here when adding a new AMR module.
+_BUILDERS = {
+    "slotcar": build_slotcar,
+    "mir250": build_mir_amr,
+}
+
+
+def _build_robot(stage, robot_cfg: dict) -> str:
+    """Dispatch to the correct robot builder based on `robot_cfg["model"]`."""
+    model = robot_cfg.get("model", "slotcar")
+    if model not in _BUILDERS:
+        raise ValueError(
+            f"Unknown robot.model={model!r}; expected one of {sorted(_BUILDERS)}"
+        )
+    return _BUILDERS[model](stage, robot_cfg)
 
 
 def build_combined_scene(output_path: str, stl_path: str, config: dict) -> str:
     """
-        Compose warehouse (from STL) and SlotCar robot onto a single USD stage.
+        Compose warehouse (from STL) and robot onto a single USD stage.
 
         `config["stl"]`: warehouse build options (scale, center_xy, ground_plane_size).
         `config["robot"]` (optional): robot build options
-            {enabled: bool, robot_name: str, spawn_position: [x, y, z]}.
-            Defaults to enabled=True.
+            {enabled: bool, model: "slotcar"|"mir250", robot_name: str,
+             spawn_position: [x, y, z], mass: float}.
+            Defaults to enabled=True, model=slotcar.
     """
     stage = _new_stage(output_path)
     build_warehouse(stage, stl_path, config["stl"])
 
     robot_cfg = config.get("robot", {}) or {}
     if robot_cfg.get("enabled", True):
-        build_slotcar(stage, robot_cfg)
+        _build_robot(stage, robot_cfg)
 
     stage.GetRootLayer().Save()
     return output_path
@@ -44,7 +64,7 @@ def build_robot_only_scene(output_path: str, config: dict) -> str:
 
     robot_cfg = config.get("robot", {}) or {}
     if robot_cfg.get("enabled", True):
-        build_slotcar(stage, robot_cfg)
+        _build_robot(stage, robot_cfg)
 
     stage.GetRootLayer().Save()
     return output_path

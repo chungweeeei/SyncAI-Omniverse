@@ -106,7 +106,34 @@ def attach_lidar_publisher(
 
     print(f"[lidar] graph={graph_path}  topic={topic}  type={publish_type}  frame={frame_id}")
     print(f"[lidar]   sensor prim={lidar_prim_path}  config={config}")
-    return graph_path
+    return lidar_prim_path
+
+
+def attach_lidar_debug_draw(lidar_prim_path: str, size: float = 0.05) -> None:
+    """Draw the RTX lidar's current-tick point cloud in the viewport as a
+    cloud of colored points. Useful for confirming visually that rays are
+    hitting the expected geometry and that the sensor's transform is right.
+
+    Uses the `RtxLidarDebugDrawPointCloud` writer (NON-buffer). The buffer
+    variant accumulates a full rotation before drawing — stable when the
+    robot is still, but drags smeared trails while driving. Non-buffer
+    flickers at ~10 Hz when stationary but stays clean under motion, which
+    matters more for nav / teleop. See memory
+    `feedback_lidar_debug_writer_choice` for the full rationale.
+
+    `size` controls the per-point marker size in world units. Raise if
+    the flicker (while stationary) makes the points hard to see.
+    """
+    import omni.replicator.core as rep
+
+    # rep.create.render_product creates a 1x1 render product bound to the
+    # lidar sensor prim; the debug-draw writer pulls RTX returns off it and
+    # submits draw commands to the viewport every frame.
+    render_product = rep.create.render_product(lidar_prim_path, [1, 1])
+    writer = rep.writers.get("RtxLidarDebugDrawPointCloud")
+    writer.initialize(color=(1.0, 0.0, 0.0, 1.0), size=size)
+    writer.attach([render_product])
+    print(f"[lidar] debug-draw attached to {lidar_prim_path} (size={size})")
 
 
 def _pick_publish_type(config: str) -> str:

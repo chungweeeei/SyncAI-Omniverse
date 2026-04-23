@@ -26,17 +26,24 @@ def attach_clock_publisher(
     import omni.graph.core as og
 
     og.Controller.edit(
+        # Step 1: Create the graph if it doesn't exist.
         {"graph_path": graph_path, "evaluator_name": "execution"},
         {
+            # Step 2: Add nodes and connections to publish the clock every tick.
             og.Controller.Keys.CREATE_NODES: [
+                # OnTick is a built-in execution trigger that fires once per simulation step, after physics and sensors update but before rendering.
                 ("OnTick", "omni.graph.action.OnPlaybackTick"),
+                # ReadSimTime is a simple utility node that outputs the current simulation time as a double in seconds.
                 ("ReadSimTime", "isaacsim.core.nodes.IsaacReadSimulationTime"),
+                # PublishClock is a node that publishes the simulation time to a ROS2 topic.
                 ("PublishClock", "isaacsim.ros2.bridge.ROS2PublishClock"),
             ],
+            # Step 3: Connect the nodes together to trigger the clock 
             og.Controller.Keys.CONNECT: [
                 ("OnTick.outputs:tick", "PublishClock.inputs:execIn"),
                 ("ReadSimTime.outputs:simulationTime", "PublishClock.inputs:timeStamp"),
             ],
+            # Step 4: Set the static attributes for the node
             og.Controller.Keys.SET_VALUES: [
                 ("PublishClock.inputs:topicName", topic),
             ],

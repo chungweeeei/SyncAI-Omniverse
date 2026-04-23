@@ -1,6 +1,18 @@
 import os
 
-from pxr import Usd, UsdGeom, UsdPhysics, UsdShade, UsdLux, Gf, Sdf
+from pxr import Usd, UsdGeom, UsdPhysics, UsdLux, Gf, Sdf
+
+from syncai_omniverse.usd._amr_common import (
+    _add_box,
+    _add_cylinder,
+    _add_sphere,
+    _apply_mass,
+    _define_preview_material,
+    _define_rigid_link,
+    _fixed_joint,
+    _revolute_joint,
+    define_shared_materials,
+)
 
 
 def build_slotcar(stage: Usd.Stage, config: dict | None = None) -> str:
@@ -25,28 +37,16 @@ def build_slotcar(stage: Usd.Stage, config: dict | None = None) -> str:
     wheel_mat = _define_preview_material(
         stage, "/World/Materials/WheelMat", Gf.Vec3f(0.7, 0.7, 0.7)
     )
-    lidar_mat = _define_preview_material(
+    _define_preview_material(
         stage, "/World/Materials/LidarMat", Gf.Vec3f(0.1, 0.1, 0.1)
     )
-    # friction_combine_mode="min" is REQUIRED. Without it PhysX falls back to
-    # its default "average" combine, and μ=0 caster × μ=0.8 ground yields
-    # μ_eff=0.4 — enough drag from the two fixed-joint casters (front+rear)
-    # to stall forward/backward motion even though the wheels spin. "min"
-    # forces the contact friction to 0, so the casters slide freely.
-    frictionless = _define_physics_material(
-        stage, "/World/Materials/FrictionlessPhys",
-        static_friction=0.0, dynamic_friction=0.0, restitution=0.0,
-        friction_combine_mode="min",
-    )
-    # High friction for drive wheels so they grip the floor instead of spinning.
-    # PhysX combines wheel + ground friction (typically min/avg). Ground is 0.8 static
-    # / 0.6 dynamic, so we set wheel materials high to give the contact decent grip.
-    wheel_phys = _define_physics_material(
-        stage, "/World/Materials/WheelPhys",
-        static_friction=2.0, dynamic_friction=1.6, restitution=0.0,
-    )
+    # Shared physics materials (WheelPhys + FrictionlessPhys). The
+    # frictionless material carries frictionCombineMode="min" so rear caster
+    # contact actually combines to mu=0 against the mu=0.8 ground instead of
+    # defaulting to mu_eff=0.4 (which stalled the chassis in earlier builds).
+    wheel_phys, frictionless = define_shared_materials(stage)
 
-    # -- Robot root Xform (pose carrier only — NOT the articulation root) --
+    # -- Robot root Xform (pose carrier only -- NOT the articulation root) --
     # ArticulationRootAPI must live on a RigidBody to produce a floating-base
     # articulation. Applied to a plain Xform parent, Isaac Sim / PhysX treats
     # it as a FIXED-BASE articulation: wheels spin but base_link is pinned in
@@ -90,7 +90,7 @@ def build_slotcar(stage: Usd.Stage, config: dict | None = None) -> str:
     # -- drivewhl_l_link : cylinder visual + SPHERE collider at (0, 0.18, -0.05).
     # Sphere collider (r=0.10) is a diagnostic substitute for the thin cylinder:
     # PhysX natively supports spheres without convex-hull approximation, so
-    # rolling contact is perfectly symmetric. A flat cylinder (r=0.10 × h=0.04)
+    # rolling contact is perfectly symmetric. A flat cylinder (r=0.10 x h=0.04)
     # is faceted by PhysX's convex-hull approximation into a polygonal disc,
     # which we suspect locks the wheel-ground contact against reverse slip
     # even though forward slip rolls fine.
@@ -103,8 +103,8 @@ def build_slotcar(stage: Usd.Stage, config: dict | None = None) -> str:
                 radius=0.10, material=None, collision=True,
                 physics_material=wheel_phys)
     # Spin axis is Y (see revolute joint below), so Iyy is the spin inertia
-    # (0.5*m*r² = 0.0025) and Ixx/Izz are the transverse inertias
-    # ((1/12)*m*(3r²+h²) = 0.00132). Had these swapped earlier.
+    # (0.5*m*r^2 = 0.0025) and Ixx/Izz are the transverse inertias
+    # ((1/12)*m*(3r^2+h^2) = 0.00132). Had these swapped earlier.
     _apply_mass(left_wheel.GetPrim(), mass=0.5, inertia=(0.00132, 0.0025, 0.00132))
 
     # -- drivewhl_r_link : cylinder visual + SPHERE collider at (0, -0.18, -0.05) --
@@ -147,7 +147,7 @@ def build_slotcar(stage: Usd.Stage, config: dict | None = None) -> str:
     # (called from `attach_lidar_publisher` at runtime) loads its own USD
     # visual for the chosen model (e.g. SICK picoScan150 mesh) as a child
     # of this prim. Our previous authoring added a r=0.04m cylinder at
-    # the sensor's exact origin — RTX raycasting hit the cylinder's inner
+    # the sensor's exact origin -- RTX raycasting hit the cylinder's inner
     # wall every scan and produced a ring of self-noise points around the
     # robot at ~4 cm range. Removing it leaves the sensor's own vendor
     # model (which is designed not to self-occlude) as the only geometry
@@ -223,150 +223,3 @@ def slotcar_to_usd(output_path: str, config: dict | None = None) -> str:
 
     stage.GetRootLayer().Save()
     return output_path
-
-
-# ---------- Helpers ----------
-
-def _define_rigid_link(stage, path: str, translate=(0.0, 0.0, 0.0)):
-    xform = UsdGeom.Xform.Define(stage, path)
-    xform.AddTranslateOp().Set(Gf.Vec3d(*translate))
-    UsdPhysics.RigidBodyAPI.Apply(xform.GetPrim())
-    return xform
-
-
-def _apply_mass(prim, mass: float, inertia):
-    mass_api = UsdPhysics.MassAPI.Apply(prim)
-    mass_api.CreateMassAttr(mass)
-    mass_api.CreateDiagonalInertiaAttr(Gf.Vec3f(*inertia))
-
-
-def _add_box(stage, path: str, size, material, collision: bool):
-    cube = UsdGeom.Cube.Define(stage, path)
-    cube.CreateSizeAttr(1.0)
-    cube.AddScaleOp().Set(Gf.Vec3f(*size))
-    if material is not None:
-        UsdShade.MaterialBindingAPI(cube.GetPrim()).Bind(material)
-    if collision:
-        UsdGeom.Imageable(cube).CreateVisibilityAttr("invisible")
-        UsdPhysics.CollisionAPI.Apply(cube.GetPrim())
-    return cube
-
-
-def _add_cylinder(stage, path: str, radius: float, height: float,
-                  rotate_xyz, material, collision: bool,
-                  physics_material=None):
-    cyl = UsdGeom.Cylinder.Define(stage, path)
-    cyl.CreateRadiusAttr(radius)
-    cyl.CreateHeightAttr(height)
-    cyl.CreateAxisAttr(UsdGeom.Tokens.z)
-    if rotate_xyz is not None:
-        cyl.AddRotateXYZOp().Set(Gf.Vec3f(*rotate_xyz))
-    if material is not None:
-        UsdShade.MaterialBindingAPI(cyl.GetPrim()).Bind(material)
-    if collision:
-        UsdGeom.Imageable(cyl).CreateVisibilityAttr("invisible")
-        UsdPhysics.CollisionAPI.Apply(cyl.GetPrim())
-        if physics_material is not None:
-            UsdShade.MaterialBindingAPI(cyl.GetPrim()).Bind(
-                physics_material, UsdShade.Tokens.weakerThanDescendants, "physics"
-            )
-    return cyl
-
-
-def _add_sphere(stage, path: str, radius: float, material, collision: bool,
-                physics_material=None):
-    sphere = UsdGeom.Sphere.Define(stage, path)
-    sphere.CreateRadiusAttr(radius)
-    if material is not None:
-        UsdShade.MaterialBindingAPI(sphere.GetPrim()).Bind(material)
-    if collision:
-        UsdGeom.Imageable(sphere).CreateVisibilityAttr("invisible")
-        UsdPhysics.CollisionAPI.Apply(sphere.GetPrim())
-        if physics_material is not None:
-            UsdShade.MaterialBindingAPI(sphere.GetPrim()).Bind(
-                physics_material, UsdShade.Tokens.weakerThanDescendants, "physics"
-            )
-    return sphere
-
-
-def _fixed_joint(stage, path: str, body0: str, body1: str,
-                 local_pos0, local_pos1):
-    joint = UsdPhysics.FixedJoint.Define(stage, path)
-    joint.CreateBody0Rel().SetTargets([Sdf.Path(body0)])
-    joint.CreateBody1Rel().SetTargets([Sdf.Path(body1)])
-    joint.CreateLocalPos0Attr().Set(Gf.Vec3f(*local_pos0))
-    joint.CreateLocalRot0Attr().Set(Gf.Quatf(1.0))
-    joint.CreateLocalPos1Attr().Set(Gf.Vec3f(*local_pos1))
-    joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0))
-    return joint
-
-
-def _revolute_joint(stage, path: str, body0: str, body1: str,
-                    local_pos0, local_pos1, axis: str = "Z",
-                    add_drive: bool = False,
-                    drive_type: str = "force",
-                    drive_damping: float = 200.0,
-                    drive_max_force: float = 8.0):
-    joint = UsdPhysics.RevoluteJoint.Define(stage, path)
-    joint.CreateBody0Rel().SetTargets([Sdf.Path(body0)])
-    joint.CreateBody1Rel().SetTargets([Sdf.Path(body1)])
-    joint.CreateLocalPos0Attr().Set(Gf.Vec3f(*local_pos0))
-    joint.CreateLocalRot0Attr().Set(Gf.Quatf(1.0))
-    joint.CreateLocalPos1Attr().Set(Gf.Vec3f(*local_pos1))
-    joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0))
-    joint.CreateAxisAttr(axis)
-    if add_drive:
-        # Velocity-mode angular drive (stiffness=0, damping>0): PhysX treats
-        # ArticulationController.velocityCommand as the target velocity, and
-        # applies torque = damping * velocity_error, clamped by maxForce.
-        #
-        # damping=200 is intentionally moderate: with a velocity ramp from
-        # DifferentialController.maxAcceleration (0.5 m/s^2 ⇒ ~0.08 rad/s
-        # vel_err per 60Hz step), drive torque = 200 * 0.08 = 16 N·m. That
-        # then gets clamped by maxForce. We keep maxForce low (8 N·m ≈ 80 N
-        # of traction per wheel) so the peak chassis reaction during big
-        # target-velocity jumps (FWD→STOP→BWD transitions) is <=160 N total
-        # instead of 300 N with the old 15 N·m cap. Net effect: visibly
-        # smaller pitch transient without sacrificing steady-state tracking
-        # (steady-state torque is ~1 N·m to hold ~0.3 m/s against rolling
-        # resistance — well under either cap).
-        #
-        # Going lower than 6 N·m starts to miss startup friction. Going
-        # higher than 12 N·m brings pitch spikes back.
-        drive = UsdPhysics.DriveAPI.Apply(joint.GetPrim(), "angular")
-        drive.CreateTypeAttr(drive_type)
-        drive.CreateStiffnessAttr(0.0)
-        drive.CreateDampingAttr(drive_damping)
-        drive.CreateMaxForceAttr(drive_max_force)
-        drive.CreateTargetVelocityAttr(0.0)
-    return joint
-
-
-def _define_preview_material(stage, path: str, color: Gf.Vec3f):
-    mat = UsdShade.Material.Define(stage, path)
-    shader = UsdShade.Shader.Define(stage, path + "/Shader")
-    shader.CreateIdAttr("UsdPreviewSurface")
-    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(color)
-    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.7)
-    mat.CreateSurfaceOutput().ConnectToSource(
-        UsdShade.ConnectableAPI(shader), "surface"
-    )
-    return mat
-
-
-def _define_physics_material(stage, path: str, static_friction: float,
-                             dynamic_friction: float, restitution: float,
-                             friction_combine_mode: str | None = None):
-    mat = UsdShade.Material.Define(stage, path)
-    api = UsdPhysics.MaterialAPI.Apply(mat.GetPrim())
-    api.CreateStaticFrictionAttr().Set(static_friction)
-    api.CreateDynamicFrictionAttr().Set(dynamic_friction)
-    api.CreateRestitutionAttr().Set(restitution)
-    if friction_combine_mode is not None:
-        # PhysX-specific attribute (PhysxSchema.PhysxMaterialAPI). We author
-        # it raw so this module keeps its pure-`pxr` / usd-core dependency.
-        # Tokens: "average" (default), "min", "multiply", "max".
-        mat.GetPrim().CreateAttribute(
-            "physxMaterial:frictionCombineMode", Sdf.ValueTypeNames.Token
-        ).Set(friction_combine_mode)
-    return mat
