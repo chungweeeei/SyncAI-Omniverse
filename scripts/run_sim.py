@@ -298,6 +298,12 @@ if not args.no_ros2:
             # Two RTX lidars on diagonal corners -> two separate /scan_* topics.
             # nav2 side must merge them (laser_scan_multi_merger) or consume
             # both in the obstacle layer.
+            # Dual-diagonal anti-ghost geometry: front sensor rotated 0°
+            # (open sector faces +X), rear rotated 180° (open sector faces -X).
+            # With 250° FOV each, the 110° blind wedge on each lidar covers
+            # the bearing to the opposite lidar, so they never cross-scan.
+            # Union coverage is still 360° because the two 250° sectors
+            # overlap 70° on each side.
             lidar_prims.append(attach_lidar_publisher(
                 stage,
                 robot_path=args.robot,
@@ -309,6 +315,8 @@ if not args.no_ros2:
                 config=args.lidar_config,
                 publish_type=args.lidar_publish_type,
                 graph_path="/LidarActionGraphFront",
+                rotation_z_deg=0.0,
+                horizontal_fov_deg=250.0,
             ))
             lidar_prims.append(attach_lidar_publisher(
                 stage,
@@ -321,6 +329,8 @@ if not args.no_ros2:
                 config=args.lidar_config,
                 publish_type=args.lidar_publish_type,
                 graph_path="/LidarActionGraphRear",
+                rotation_z_deg=180.0,
+                horizontal_fov_deg=250.0,
             ))
             ns_prefix = f"/{args.ros_namespace}" if args.ros_namespace else ""
             print(f"[run_sim] dual lidar attached: {ns_prefix}/scan_front + "

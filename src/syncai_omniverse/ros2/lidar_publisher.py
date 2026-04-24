@@ -10,7 +10,9 @@ Requires Isaac Sim runtime: `omni.graph.core`, `omni.kit.commands`, and the
 `isaacsim.sensors.rtx` + `isaacsim.ros2.bridge` extensions must be enabled
 before calling `attach_lidar_publisher`.
 """
-from pxr import Sdf
+import math
+
+from pxr import Gf, Sdf, UsdGeom
 
 from syncai_omniverse.ros2._ns import (
     apply_frame_namespace as _apply_frame_namespace,
@@ -29,6 +31,8 @@ def attach_lidar_publisher(
     publish_type: str = "auto",
     namespace: str = "",
     graph_path: str = "/LidarActionGraph",
+    rotation_z_deg: float = 0.0,
+    horizontal_fov_deg: float | None = None,
 ) -> str:
     """
         Spawn an RTX lidar at `{robot_path}/{lidar_link}/{lidar_name}` using the
@@ -46,6 +50,20 @@ def attach_lidar_publisher(
         with elevation [-7.2, +34.3]) publishes as `point_cloud`, because the
         ROS2RtxLidarHelper laser_scan mode rejects sensors with non-zero
         elevation.
+
+        `rotation_z_deg` rotates the created RTX sensor prim about its local
+        Z axis (only the sensor, not the parent rigid-body link — that would
+        fight the fixed joint's LocalRot). Used on MiR250 dual_diagonal to
+        point front lidar's open sector forward (0°) and rear lidar's open
+        sector backward (180°), placing each lidar's blind wedge on the
+        opposite lidar so they don't cross-scan.
+
+        `horizontal_fov_deg` (optional) asks the publisher to crop the
+        ROS2 scan output to `horizontal_fov_deg` worth of azimuth by setting
+        `horizontalMinAngle` / `horizontalMaxAngle` pins on the ROS2
+        LidarHelper node. If those pins don't exist in this Isaac Sim
+        build, a warning is printed and the native sensor FOV is used --
+        the caller should then fall back to a custom lidar config JSON.
 
         Returns the graph prim path.
     """
@@ -81,6 +99,13 @@ def attach_lidar_publisher(
     frame_id = _apply_frame_namespace(namespace, frame_id)
     print(f"[lidar] created RTX sensor prim at {lidar_prim_path}")
 
+    # Rotate the RTX sensor's local frame without touching the parent
+    # rigid-body link. MiR250 dual_diagonal: front=0° (open sector +X),
+    # rear=180° (open sector -X) -- blind wedges face the opposite lidar.
+    if rotation_z_deg != 0.0:
+        UsdGeom.Xformable(sensor).AddRotateZOp().Set(float(rotation_z_deg))
+        print(f"[lidar]   rotation_z={rotation_z_deg:.1f}° applied to sensor prim")
+
     og.Controller.edit(
         {"graph_path": graph_path, "evaluator_name": "execution"},
         {
@@ -104,9 +129,62 @@ def attach_lidar_publisher(
         },
     )
 
+    if horizontal_fov_deg is not None:
+        _try_set_horizontal_fov(graph_path, horizontal_fov_deg)
+
     print(f"[lidar] graph={graph_path}  topic={topic}  type={publish_type}  frame={frame_id}")
     print(f"[lidar]   sensor prim={lidar_prim_path}  config={config}")
     return lidar_prim_path
+
+
+def _try_set_horizontal_fov(graph_path: str, fov_deg: float) -> None:
+    """Crop the ROS2 scan output to `fov_deg` azimuth span by setting
+    horizontalMinAngle / horizontalMaxAngle on the LidarHelper node.
+
+    Isaac Sim 5.1 may or may not expose these pins. Introspect the node
+    first; on miss, print guidance for the JSON-config fallback instead
+    of crashing the graph.
+    """
+    import omni.graph.core as og
+
+    helper_path = f"{graph_path}/LidarHelper"
+    try:
+        node = og.Controller.node(helper_path)
+    except Exception as exc:
+        print(f"[lidar]   fov: could not resolve LidarHelper node: {exc}")
+        return
+
+    attr_names = {a.get_name() for a in node.get_attributes()}
+    min_candidates = ["inputs:horizontalMinAngle", "inputs:minAzimuthAngle",
+                      "inputs:horizontalMinDeg"]
+    max_candidates = ["inputs:horizontalMaxAngle", "inputs:maxAzimuthAngle",
+                      "inputs:horizontalMaxDeg"]
+    min_name = next((n for n in min_candidates if n in attr_names), None)
+    max_name = next((n for n in max_candidates if n in attr_names), None)
+
+    if min_name is None or max_name is None:
+        # Print the angle-related attrs we saw so future debugging is one log
+        # line away.
+        angle_attrs = sorted(n for n in attr_names if "angle" in n.lower() or "azimuth" in n.lower())
+        print(f"[lidar]   fov: horizontalMin/MaxAngle not exposed on ROS2RtxLidarHelper "
+              f"(saw angle-related={angle_attrs or 'none'}). "
+              f"Native sensor FOV kept; falling back to JSON config is required for true {fov_deg}° crop.")
+        return
+
+    # Most OmniGraph angle pins are radians. If the attr name contains "Deg"
+    # we assume degrees instead.
+    use_radians = not (min_name.endswith("Deg") or max_name.endswith("Deg"))
+    half = fov_deg / 2.0
+    if use_radians:
+        min_val, max_val = -math.radians(half), math.radians(half)
+        unit = "rad"
+    else:
+        min_val, max_val = -half, half
+        unit = "deg"
+    og.Controller.attribute(f"{helper_path}.{min_name}").set(min_val)
+    og.Controller.attribute(f"{helper_path}.{max_name}").set(max_val)
+    print(f"[lidar]   fov: {fov_deg:.1f}° applied via {min_name}/{max_name} "
+          f"({min_val:.4f},{max_val:.4f} {unit})")
 
 
 def attach_lidar_debug_draw(lidar_prim_path: str, size: float = 0.05) -> None:

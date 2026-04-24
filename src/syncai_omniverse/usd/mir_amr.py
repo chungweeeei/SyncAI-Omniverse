@@ -91,11 +91,15 @@ def build_mir_amr(stage: Usd.Stage, config: dict | None = None) -> str:
     UsdPhysics.MassAPI.Apply(base_link.GetPrim()).CreateMassAttr(base_mass)
 
     # -- load_plate : thin cosmetic top deck, visual only, no rigid body --
-    # Child of base_link so the fixed-body semantics inherit. No collider so
-    # the top surface won't block the RTX lidars mounted on the diagonal
-    # corner stems above it.
+    # Child of base_link so the fixed-body semantics inherit. No collider
+    # so it doesn't scatter lidar rays or block payloads. Translate z=0.21
+    # places the plate bottom at +0.20 and top at +0.22, leaving a 5 cm
+    # gap between chassis top (+0.15) and plate bottom (+0.20). The
+    # diagonal safety lidars live inside that gap at z=+0.175 -- same
+    # silhouette as a real MiR250 where the LS-140/R2000 sensors peek out
+    # of a cosmetic notch between the shell and the body.
     plate_xf = UsdGeom.Xform.Define(stage, f"{robot_path}/base_link/load_plate")
-    plate_xf.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.16))
+    plate_xf.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.21))
     _add_box(stage, f"{robot_path}/base_link/load_plate/visual",
              size=(0.78, 0.56, 0.02), material=plate_mat, collision=False)
 
@@ -140,14 +144,25 @@ def build_mir_amr(stage: Usd.Stage, config: dict | None = None) -> str:
     # is required, else PhysX averages mu=0 with mu=0.8 ground -> mu_eff=0.4
     # -> chassis stalls.
     #
-    # Z height is critical: caster BOTTOM must touch ground when wheel bottoms
-    # do. Wheel bottom = -0.20 (center -0.10 - radius 0.10); caster bottom
-    # must also be -0.20, so caster center = -0.20 + r_caster = -0.16.
+    # Z height is critical: caster BOTTOM sits 1 cm ABOVE ground when wheels
+    # are in nominal contact. Wheel bottom = -0.20 (center -0.10 - radius
+    # 0.10); we want caster bottom = -0.19, so caster center = -0.19 +
+    # r_caster = -0.15. This intentionally leaves the casters off-ground in
+    # steady state so the 2 drive wheels carry 100% of the normal load and
+    # get full traction -- the wheels-only configuration matches the
+    # "exactly ONE caster" memory rule (feedback_diff_drive_single_caster).
+    # Casters only engage when the chassis tips or bounces more than 1 cm,
+    # acting as anti-tip backstops rather than load-bearing supports.
+    # (An earlier version parked the casters at -0.16 so they shared ground
+    # contact with the wheels; PhysX LCP then split the normal force across
+    # all 6 points, left the wheels with near-zero normal → zero traction →
+    # wheels spun but chassis didn't translate. Same symptom as in
+    # `feedback_diff_drive_single_caster` but with 4 casters instead of 2.)
     caster_positions = {
-        "caster_fl_link": (0.36, 0.24, -0.16),   # front-left
-        "caster_fr_link": (0.36, -0.24, -0.16),  # front-right
-        "caster_rl_link": (-0.36, 0.24, -0.16),  # rear-left
-        "caster_rr_link": (-0.36, -0.24, -0.16), # rear-right
+        "caster_fl_link": (0.36, 0.24, -0.15),   # front-left
+        "caster_fr_link": (0.36, -0.24, -0.15),  # front-right
+        "caster_rl_link": (-0.36, 0.24, -0.15),  # rear-left
+        "caster_rr_link": (-0.36, -0.24, -0.15), # rear-right
     }
     for name, pos in caster_positions.items():
         link = _define_rigid_link(stage, f"{robot_path}/{name}", translate=pos)
@@ -167,20 +182,22 @@ def build_mir_amr(stage: Usd.Stage, config: dict | None = None) -> str:
     # own inner wall and emit a ring of self-noise points. Same lesson as
     # SlotCar's lidar_link.
     #
-    # Z height is critical: RTX raycasts against VISUAL meshes (not
-    # colliders), so if the sensor origin sits inside chassis/visual or
-    # load_plate/visual, every horizontal ray immediately hits a robot-
-    # owned surface and produces a ring of self-points around the robot.
-    # Chassis visual box extends to local z=+0.15; load_plate visual sits
-    # at z=[+0.15, +0.17]. Raise lidars to z=+0.25 so horizontal rays
-    # clear the chassis top by 10 cm and clear the load_plate top by 8 cm.
+    # Z=0.175 lives inside the 5 cm gap between the chassis top (+0.15)
+    # and the raised load_plate bottom (+0.20), matching the real MiR250
+    # safety-lidar silhouette where the sensor peeks out of a corner
+    # notch between body and shell. Horizontal rays at this height clear
+    # both surfaces cleanly, but the opposite lidar is still visible --
+    # so `lidar_publisher.py` also (a) rotates each sensor (front=0°,
+    # rear=180°) so the open sector faces outward, and (b) crops FOV to
+    # 250° so the 110° blind wedge covers the bearing to the opposite
+    # lidar. Net union coverage is still 360° (70° side overlap).
     lidar_front = _define_rigid_link(stage, f"{robot_path}/lidar_link_front",
-                                     translate=(0.38, 0.26, 0.25))
+                                     translate=(0.38, 0.26, 0.175))
     _apply_mass(lidar_front.GetPrim(), mass=0.1, inertia=(0.00004, 0.00004, 0.00004))
 
     # -- lidar_link_rear : rear-right mount point for RTX lidar #2 --
     lidar_rear = _define_rigid_link(stage, f"{robot_path}/lidar_link_rear",
-                                    translate=(-0.38, -0.26, 0.25))
+                                    translate=(-0.38, -0.26, 0.175))
     _apply_mass(lidar_rear.GetPrim(), mass=0.1, inertia=(0.00004, 0.00004, 0.00004))
 
     # -- Joints --
@@ -218,11 +235,11 @@ def build_mir_amr(stage: Usd.Stage, config: dict | None = None) -> str:
     _fixed_joint(stage, f"{joints_path}/lidar_joint_front",
                  body0=f"{robot_path}/base_link",
                  body1=f"{robot_path}/lidar_link_front",
-                 local_pos0=(0.38, 0.26, 0.25), local_pos1=(0.0, 0.0, 0.0))
+                 local_pos0=(0.38, 0.26, 0.175), local_pos1=(0.0, 0.0, 0.0))
 
     _fixed_joint(stage, f"{joints_path}/lidar_joint_rear",
                  body0=f"{robot_path}/base_link",
                  body1=f"{robot_path}/lidar_link_rear",
-                 local_pos0=(-0.38, -0.26, 0.25), local_pos1=(0.0, 0.0, 0.0))
+                 local_pos0=(-0.38, -0.26, 0.175), local_pos1=(0.0, 0.0, 0.0))
 
     return robot_path

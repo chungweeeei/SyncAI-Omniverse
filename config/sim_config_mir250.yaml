@@ -18,6 +18,12 @@ robot:
   # scenarios; drive gains in run_sim.py (damping=800, maxForce=40) are
   # tuned for this mass and will need adjustment if it changes substantially.
   mass: 100.0
+  # dual_diagonal: two RTX lidars at (±0.38, ±0.26, 0.175), sitting in the
+  # 5 cm gap between chassis top (+0.15) and the raised load_plate bottom
+  # (+0.20), mirroring real MiR250's corner safety-lidar silhouette. Ghost
+  # avoidance: front sensor rotated 0°, rear rotated 180°, each cropped to
+  # 250° FOV by run_sim.py -- the 110° blind wedges line up with the
+  # bearing to the opposite lidar so they don't cross-scan.
   lidar_layout: "dual_diagonal"
 
 output:
