@@ -8,15 +8,30 @@ stl:
 
 robot:
   enabled: true
-  # model: which AMR to spawn. One of: "slotcar" | "mir250".
-  model: "slotcar"
-  robot_name: "SlotCar"
-  spawn_position: [0.0, 0.0, 0.15]
-  # mass: base_link mass in kg (used by mir250 only; slotcar hard-codes 10 kg)
-  mass: 10.0
-  # lidar_layout: "single_center" (SlotCar default) | "dual_diagonal" (mir250 default).
-  # dual_diagonal publishes /scan_front + /scan_rear on two RTX lidars.
-  lidar_layout: "single_center"
+  # model: which AMR to spawn. Currently only "mir250" is supported.
+  model: "mir250"
+  robot_name: "MirAMR"
+  spawn_position: [0.0, 0.0, 0.20]
+  # mass: base_link mass in kg (mir250 default = 100 kg)
+  mass: 100.0
+  # lidar_layout: "dual_diagonal" publishes /scan_front + /scan_rear on two
+  # RTX lidars (mir250 default). "single_center" runs one /scan.
+  lidar_layout: "dual_diagonal"
+
+doors:
+  # Automatic sliding doors. Each entry becomes a fixed-base articulation
+  # under /World/Doors/<name> with two prismatic-jointed leaves. The ROS2
+  # bridge (attached at runtime by run_sim.py) subscribes to `topic`
+  # (std_msgs/Bool) and commands open (true) / closed (false).
+  - name: "EastDoor"
+    position: [8.35, 5.06, 0.0]   # centre of opening at floor; tune in usdview
+    rotation_z_deg: 0.0           # 0 = leaves slide along world Y
+    opening_width: 3.0
+    opening_height: 2.0
+    leaf_thickness: 0.05
+    leaf_mass: 25.0
+    # open_target omitted -> auto = opening_width/2 - 0.05 = 1.2 m per leaf
+    topic: "/door/east/cmd"
 
 output:
-  scene_path: "scenes/dp1f_slotcar.usda"
+  scene_path: "scenes/dp1f_mir.usda"

@@ -27,4 +27,4 @@ robot:
   lidar_layout: "dual_diagonal"
 
 output:
-  scene_path: "scenes/dp1f_mir250.usda"
+  scene_path: "scenes/dp1f_mir.usda"
