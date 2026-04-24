@@ -8,8 +8,15 @@ stl:
 
 robot:
   enabled: true
+  # model: which AMR to spawn. One of: "slotcar" | "mir250".
+  model: "slotcar"
   robot_name: "SlotCar"
   spawn_position: [0.0, 0.0, 0.15]
+  # mass: base_link mass in kg (used by mir250 only; slotcar hard-codes 10 kg)
+  mass: 10.0
+  # lidar_layout: "single_center" (SlotCar default) | "dual_diagonal" (mir250 default).
+  # dual_diagonal publishes /scan_front + /scan_rear on two RTX lidars.
+  lidar_layout: "single_center"
 
 output:
   scene_path: "scenes/dp1f_slotcar.usda"

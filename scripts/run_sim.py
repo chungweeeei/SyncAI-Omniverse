@@ -5,32 +5,77 @@ Run inside the isaac-sim container:
     /isaac-sim/python.sh scripts/run_sim.py --scene /workspace/scenes/warehouse.usda
     /isaac-sim/python.sh scripts/run_sim.py --headless
     /isaac-sim/python.sh scripts/run_sim.py --no-ros2       # skip TF setup
+
+Robot models:
+    --robot-model=slotcar   -> /World/SlotCar (default)
+    --robot-model=mir250    -> /World/MirAMR (MiR250-style chassis, dual lidar)
 """
 import argparse
 import sys
 from pathlib import Path
 
+# Per-model defaults. Keys selected by --robot-model; CLI flags still override.
+_MODEL_DEFAULTS = {
+    "slotcar": {
+        "robot_prim": "/World/SlotCar",
+        "scene": "/workspace/scenes/dp1f_slotcar.usda",
+        "wheel_distance": 0.36,
+        "wheel_drive_damping": 200.0,
+        "wheel_drive_max_force": 8.0,
+        "max_linear_accel": 2.5,
+        "max_linear_decel": 2.5,
+        "max_angular_accel": 2.0,
+        "lidar_layout": "single_center",
+        "tf_targets": "lidar_link:scan",
+    },
+    "mir250": {
+        "robot_prim": "/World/MirAMR",
+        "scene": "/workspace/scenes/dp1f_mir250.usda",
+        # MiR250 is ~10x heavier than SlotCar; scale drive gains up and
+        # ramp accel limits down so the chassis tracks cmd_vel without
+        # startup stall or excessive pitch transient on accel steps.
+        "wheel_distance": 0.445,
+        "wheel_drive_damping": 800.0,
+        "wheel_drive_max_force": 40.0,
+        "max_linear_accel": 1.0,
+        "max_linear_decel": 1.5,
+        "max_angular_accel": 1.5,
+        "lidar_layout": "dual_diagonal",
+        "tf_targets": "lidar_link_front:scan_front,lidar_link_rear:scan_rear",
+    },
+}
+
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument(
+    "--robot-model",
+    default="slotcar",
+    choices=sorted(_MODEL_DEFAULTS),
+    help="Which AMR model the scene contains. Selects per-model defaults for "
+         "--robot, --scene, wheel distance, drive gains, and lidar layout. "
+         "Individual CLI flags still override these.",
+)
+parser.add_argument(
     "--scene",
-    default="/workspace/scenes/dp1f_slotcar.usda",
-    help="Path to the USD stage to open.",
+    default=None,
+    help="Path to the USD stage to open. Defaults per --robot-model.",
 )
 parser.add_argument(
     "--robot",
-    default="/World/SlotCar",
-    help="Prim path of the articulation root whose TF should be published.",
+    default=None,
+    help="Prim path of the articulation root. Defaults per --robot-model "
+         "(/World/SlotCar or /World/MirAMR).",
 )
 parser.add_argument("--headless", action="store_true", help="Run without a window.")
 parser.add_argument("--no-ros2", action="store_true", help="Skip ROS2 TF publisher setup.")
 parser.add_argument(
     "--tf-targets",
-    default="lidar_link:scan",
+    default=None,
     help="Comma-separated link names under --robot to publish (relative to --robot). "
          "Each entry may use `prim:frame_id` to decouple the USD prim from the "
-         "published TF frame id (default `lidar_link:scan` exposes the SlotCar "
-         "lidar prim as frame `scan`, matching the /scan message header). Use "
-         "'auto' for every rigid-body child link (prim name == frame id).",
+         "published TF frame id. Defaults per --robot-model (slotcar: "
+         "`lidar_link:scan`; mir250: `lidar_link_front:scan_front,"
+         "lidar_link_rear:scan_rear`). Use 'auto' for every rigid-body child link "
+         "(prim name == frame id).",
 )
 parser.add_argument(
     "--no-clock",
@@ -67,6 +112,13 @@ parser.add_argument(
     help="Skip RTX lidar + /scan publisher.",
 )
 parser.add_argument(
+    "--lidar-debug-draw",
+    action="store_true",
+    help="Draw each RTX lidar's returns in the viewport as red points "
+         "(RtxLidarDebugDrawPointCloud writer, non-buffer). Useful for "
+         "visually confirming the scan coverage / mount pose.",
+)
+parser.add_argument(
     "--lidar-config",
     default="SICK_picoScan150",
     help="Lidar config stem from SUPPORTED_LIDAR_CONFIGS. True 2D (publish as "
@@ -83,17 +135,28 @@ parser.add_argument(
          "(elevation=[0,0]) and point_cloud otherwise.",
 )
 parser.add_argument(
+    "--lidar-layout",
+    default=None,
+    choices=["single_center", "dual_diagonal"],
+    help="Lidar mounting pattern. single_center: one RTX lidar on one mount "
+         "point, publishing to --cmd-vel-topic-style single /scan. "
+         "dual_diagonal: two RTX lidars at front-left + rear-right, publishing "
+         "/scan_front + /scan_rear on separate graphs (matches real MiR250 "
+         "safety-lidar layout). Defaults per --robot-model.",
+)
+parser.add_argument(
     "--lidar-parent",
-    default="lidar_link",
-    help="Link name under --robot to parent the RTX lidar to (SlotCar uses "
-         "'lidar_link'; TurtleBot3 would use 'base_scan').",
+    default=None,
+    help="For single_center layouts, link name under --robot to parent the "
+         "RTX lidar to. Defaults: slotcar=`lidar_link`. Ignored for dual_diagonal "
+         "(both mount points are hard-coded to `lidar_link_front` + "
+         "`lidar_link_rear`).",
 )
 parser.add_argument(
     "--lidar-frame",
     default="scan",
-    help="ROS frame_id used in the /scan message header (and the TF child "
-         "frame id if --tf-targets includes the lidar's USD prim). Decouples "
-         "the sensor's ROS identity from the USD prim name.",
+    help="For single_center layouts, ROS frame_id used in the /scan message "
+         "header. Ignored for dual_diagonal (frames are `scan_front` + `scan_rear`).",
 )
 parser.add_argument(
     "--ros-namespace",
@@ -113,6 +176,21 @@ parser.add_argument(
 )
 args = parser.parse_args()
 
+# Resolve per-model defaults. CLI flags override; unset flags inherit from
+# _MODEL_DEFAULTS[args.robot_model].
+_model_cfg = _MODEL_DEFAULTS[args.robot_model]
+if args.scene is None:
+    args.scene = _model_cfg["scene"]
+if args.robot is None:
+    args.robot = _model_cfg["robot_prim"]
+if args.tf_targets is None:
+    args.tf_targets = _model_cfg["tf_targets"]
+if args.lidar_layout is None:
+    args.lidar_layout = _model_cfg["lidar_layout"]
+if args.lidar_parent is None:
+    # Only used for single_center; dual_diagonal hard-codes both mount points.
+    args.lidar_parent = "lidar_link"
+
 scene_path = Path(args.scene).resolve()
 if not scene_path.exists():
     raise SystemExit(f"Scene not found: {scene_path}")
@@ -130,6 +208,8 @@ import omni.timeline
 from isaacsim.core.utils.stage import open_stage, is_stage_loading
 
 print(f"[run_sim] Opening stage: {scene_path}")
+print(f"[run_sim] robot-model={args.robot_model}  robot={args.robot}  "
+      f"lidar-layout={args.lidar_layout}")
 open_stage(str(scene_path))
 # Wait for the stage (and its references) to finish loading.
 while is_stage_loading():
@@ -190,6 +270,12 @@ if not args.no_ros2:
             namespace=args.ros_namespace,
             debug=args.debug_cmdvel,
             topic=args.cmd_vel_topic,
+            wheel_distance=_model_cfg["wheel_distance"],
+            wheel_drive_damping=_model_cfg["wheel_drive_damping"],
+            wheel_drive_max_force=_model_cfg["wheel_drive_max_force"],
+            max_linear_accel=_model_cfg["max_linear_accel"],
+            max_linear_decel=_model_cfg["max_linear_decel"],
+            max_angular_accel=_model_cfg["max_angular_accel"],
         )
         ns_prefix = f"/{args.ros_namespace}" if args.ros_namespace else ""
         print(f"[run_sim] cmd_vel subscriber attached: {ns_prefix}{args.cmd_vel_topic} -> "
@@ -202,21 +288,72 @@ if not args.no_ros2:
         for _ in range(20):
             simulation_app.update()
 
-        from syncai_omniverse.ros2.lidar_publisher import attach_lidar_publisher
-
-        attach_lidar_publisher(
-            stage,
-            robot_path=args.robot,
-            lidar_link=args.lidar_parent,
-            frame_id=args.lidar_frame,
-            namespace=args.ros_namespace,
-            config=args.lidar_config,
-            publish_type=args.lidar_publish_type,
+        from syncai_omniverse.ros2.lidar_publisher import (
+            attach_lidar_debug_draw,
+            attach_lidar_publisher,
         )
-        ns_prefix = f"/{args.ros_namespace}" if args.ros_namespace else ""
-        print(f"[run_sim] lidar publisher attached: {ns_prefix}/scan  "
-              f"config={args.lidar_config}  parent={args.lidar_parent}  "
-              f"publish_type={args.lidar_publish_type}")
+
+        lidar_prims: list[str] = []
+        if args.lidar_layout == "dual_diagonal":
+            # Two RTX lidars on diagonal corners -> two separate /scan_* topics.
+            # nav2 side must merge them (laser_scan_multi_merger) or consume
+            # both in the obstacle layer.
+            # Dual-diagonal anti-ghost geometry: front sensor rotated 0°
+            # (open sector faces +X), rear rotated 180° (open sector faces -X).
+            # With 250° FOV each, the 110° blind wedge on each lidar covers
+            # the bearing to the opposite lidar, so they never cross-scan.
+            # Union coverage is still 360° because the two 250° sectors
+            # overlap 70° on each side.
+            lidar_prims.append(attach_lidar_publisher(
+                stage,
+                robot_path=args.robot,
+                lidar_link="lidar_link_front",
+                lidar_name="LidarFront",
+                topic="/scan_front",
+                frame_id="scan_front",
+                namespace=args.ros_namespace,
+                config=args.lidar_config,
+                publish_type=args.lidar_publish_type,
+                graph_path="/LidarActionGraphFront",
+                rotation_z_deg=0.0,
+                horizontal_fov_deg=250.0,
+            ))
+            lidar_prims.append(attach_lidar_publisher(
+                stage,
+                robot_path=args.robot,
+                lidar_link="lidar_link_rear",
+                lidar_name="LidarRear",
+                topic="/scan_rear",
+                frame_id="scan_rear",
+                namespace=args.ros_namespace,
+                config=args.lidar_config,
+                publish_type=args.lidar_publish_type,
+                graph_path="/LidarActionGraphRear",
+                rotation_z_deg=180.0,
+                horizontal_fov_deg=250.0,
+            ))
+            ns_prefix = f"/{args.ros_namespace}" if args.ros_namespace else ""
+            print(f"[run_sim] dual lidar attached: {ns_prefix}/scan_front + "
+                  f"{ns_prefix}/scan_rear  config={args.lidar_config}")
+        else:
+            lidar_prims.append(attach_lidar_publisher(
+                stage,
+                robot_path=args.robot,
+                lidar_link=args.lidar_parent,
+                frame_id=args.lidar_frame,
+                topic="/scan",
+                namespace=args.ros_namespace,
+                config=args.lidar_config,
+                publish_type=args.lidar_publish_type,
+            ))
+            ns_prefix = f"/{args.ros_namespace}" if args.ros_namespace else ""
+            print(f"[run_sim] lidar publisher attached: {ns_prefix}/scan  "
+                  f"config={args.lidar_config}  parent={args.lidar_parent}  "
+                  f"publish_type={args.lidar_publish_type}")
+
+        if args.lidar_debug_draw:
+            for prim_path in lidar_prims:
+                attach_lidar_debug_draw(prim_path)
 
 omni.timeline.get_timeline_interface().play()
 
@@ -267,9 +404,9 @@ def _pose_probe_factory(robot_path: str):
             return None, None, None
         try:
             # `isaacsim.core.prims.Articulation` requires the pattern to match
-            # a prim with both RigidBodyAPI and ArticulationRootAPI. The
-            # SlotCar authoring puts ArticulationRootAPI on `base_link`, not
-            # on the `/World/SlotCar` Xform, so we descend explicitly.
+            # a prim with both RigidBodyAPI and ArticulationRootAPI. Both
+            # SlotCar and MirAMR put ArticulationRootAPI on `base_link`, not
+            # on the `/World/<Robot>` Xform, so we descend explicitly.
             art_root_path = _find_articulation_root(stage_, robot_path)
             art = Articulation(prim_paths_expr=art_root_path)
             # `initialize` binds the view to the live PhysX articulation; it
