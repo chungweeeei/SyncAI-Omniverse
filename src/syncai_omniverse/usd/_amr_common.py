@@ -195,6 +195,53 @@ def _define_preview_material(stage, path: str, color: Gf.Vec3f):
     return mat
 
 
+def _define_emissive_material(stage, path: str, emissive_color: Gf.Vec3f,
+                              base_color: Gf.Vec3f = Gf.Vec3f(0.05, 0.05, 0.05)):
+    mat = UsdShade.Material.Define(stage, path)
+    shader = UsdShade.Shader.Define(stage, path + "/Shader")
+    shader.CreateIdAttr("UsdPreviewSurface")
+    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(base_color)
+    shader.CreateInput("emissiveColor", Sdf.ValueTypeNames.Color3f).Set(emissive_color)
+    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.6)
+    mat.CreateSurfaceOutput().ConnectToSource(
+        UsdShade.ConnectableAPI(shader), "surface"
+    )
+    return mat
+
+
+def _define_textured_material(stage, path: str, png_asset_path: str,
+                              fallback_color: Gf.Vec3f = Gf.Vec3f(1.0, 1.0, 1.0)):
+    mat = UsdShade.Material.Define(stage, path)
+    surface = UsdShade.Shader.Define(stage, path + "/Shader")
+    surface.CreateIdAttr("UsdPreviewSurface")
+    surface.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(fallback_color)
+    surface.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.5)
+
+    # st reader: pulls UV primvar named "st". UsdGeom.Cube auto-synthesises
+    # face-aligned UVs in Hydra Storm + RTX, so the cube faces all show the
+    # full texture without authoring primvars:st explicitly.
+    st_reader = UsdShade.Shader.Define(stage, path + "/StReader")
+    st_reader.CreateIdAttr("UsdPrimvarReader_float2")
+    st_reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
+    st_out = st_reader.CreateOutput("result", Sdf.ValueTypeNames.Float2)
+
+    tex = UsdShade.Shader.Define(stage, path + "/Tex")
+    tex.CreateIdAttr("UsdUVTexture")
+    tex.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(png_asset_path))
+    # Clamp so the bitmap never tiles across the face -- AprilTag detection
+    # requires a single, complete tag in frame.
+    tex.CreateInput("wrapS", Sdf.ValueTypeNames.Token).Set("clamp")
+    tex.CreateInput("wrapT", Sdf.ValueTypeNames.Token).Set("clamp")
+    tex.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(st_out)
+    rgb_out = tex.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+
+    surface.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(rgb_out)
+    mat.CreateSurfaceOutput().ConnectToSource(
+        UsdShade.ConnectableAPI(surface), "surface"
+    )
+    return mat
+
+
 def _define_physics_material(stage, path: str, static_friction: float,
                              dynamic_friction: float, restitution: float,
                              friction_combine_mode: str | None = None):

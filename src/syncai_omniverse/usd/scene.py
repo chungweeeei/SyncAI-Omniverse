@@ -5,6 +5,7 @@ from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics, UsdShade
 from syncai_omniverse.usd.stl_to_usd import build_warehouse
 from syncai_omniverse.usd.mir_amr import build_mir_amr
 from syncai_omniverse.usd.auto_door import build_auto_door
+from syncai_omniverse.usd.charging_station import build_charging_station
 
 
 # Registry of available robot model builders. `robot.model` in sim_config.yaml
@@ -44,6 +45,9 @@ def build_combined_scene(output_path: str, stl_path: str, config: dict) -> str:
     for door_cfg in config.get("doors") or []:
         build_auto_door(stage, door_cfg)
 
+    for station_cfg in config.get("charging_stations") or []:
+        build_charging_station(stage, station_cfg)
+
     stage.GetRootLayer().Save()
     return output_path
 
@@ -70,6 +74,9 @@ def build_robot_only_scene(output_path: str, config: dict) -> str:
 
     for door_cfg in config.get("doors") or []:
         build_auto_door(stage, door_cfg)
+
+    for station_cfg in config.get("charging_stations") or []:
+        build_charging_station(stage, station_cfg)
 
     stage.GetRootLayer().Save()
     return output_path

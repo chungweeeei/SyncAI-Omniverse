@@ -22,7 +22,17 @@ _MODEL_DEFAULTS = {
         # enough torque to track cmd_vel without startup stall, but capped
         # so pitch transient on accel steps stays inside the caster-engage
         # envelope.
-        "wheel_distance": 0.445,
+        #
+        # IMPORTANT: wheel_radius and wheel_distance MUST match the actual
+        # geometry authored in the USD stage. If sim_config.yaml sets
+        # `robot.scale = s`, both must be the unscaled values * s:
+        #   wheel_radius   = 0.10 * s
+        #   wheel_distance = 0.445 * s
+        # Mismatch -> DifferentialController emits wrong wheel ω for a
+        # given cmd_vel, so the robot moves slower than commanded (or
+        # appears stalled at small commands). Currently set for scale=0.7.
+        "wheel_radius": 0.07,        # = 0.10 * 0.7
+        "wheel_distance": 0.3115,    # = 0.445 * 0.7
         "wheel_drive_damping": 800.0,
         "wheel_drive_max_force": 40.0,
         "max_linear_accel": 1.0,
@@ -262,6 +272,7 @@ if not args.no_ros2:
             namespace=args.ros_namespace,
             debug=args.debug_cmdvel,
             topic=args.cmd_vel_topic,
+            wheel_radius=_model_cfg["wheel_radius"],
             wheel_distance=_model_cfg["wheel_distance"],
             wheel_drive_damping=_model_cfg["wheel_drive_damping"],
             wheel_drive_max_force=_model_cfg["wheel_drive_max_force"],

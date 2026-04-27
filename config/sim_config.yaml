@@ -11,9 +11,23 @@ robot:
   # model: which AMR to spawn. Currently only "mir250" is supported.
   model: "mir250"
   robot_name: "MirAMR"
-  spawn_position: [0.0, 0.0, 0.20]
-  # mass: base_link mass in kg (mir250 default = 100 kg)
-  mass: 100.0
+  # spawn z must match scaled wheel radius: z = 0.20 * scale so wheel
+  # bottoms touch the ground at sim start. With scale=0.7 -> z=0.14.
+  # Wrong z floats the chassis -> wheels spin without traction -> robot
+  # doesn't translate even though cmd_vel reaches the drive joints.
+  spawn_position: [0.0, 0.0, 0.14]
+  # mass: base_link mass in kg (mir250 default = 100 kg).
+  # Commented out so the scaled default (100 * scale^3) applies, keeping
+  # the chassis:wheel mass ratio near 50:1. With explicit mass=100 and
+  # scale=0.7, wheels scaled to 0.686 kg gave a 146:1 ratio which exceeds
+  # PhysX articulation's stable range and made low-angular cmd_vel produce
+  # sign-flipped wheel ω (rotation in wrong direction or zero).
+  # mass: 100.0
+  # scale: uniform size multiplier for the whole robot (1.0 = real MiR250
+  # dimensions ~0.80 x 0.58 x 0.30 m). Linear dims x scale, default mass
+  # x scale^3, default inertias x scale^5 to keep density / m*r^2 invariant.
+  # If `mass` is set explicitly above it overrides the scale^3 default.
+  scale: 0.7
   # lidar_layout: "dual_diagonal" publishes /scan_front + /scan_rear on two
   # RTX lidars (mir250 default). "single_center" runs one /scan.
   lidar_layout: "dual_diagonal"
@@ -35,6 +49,18 @@ doors:
     leaf_mass: 25.0
     # open_target omitted -> auto = opening_width/2 - 0.05 = 1.2 m per leaf
     # cmd_topic / state_topic optional; default from id
+
+charging_stations:
+  # Static MiR250-style rear-docking charging dock. Pure scene prop with a
+  # collidable enclosure + faceplate plus a small floor docking plate. No
+  # ROS2, no motion. Each entry becomes /World/ChargingStations/<name>.
+  # Robot reverses along the prop's local -X to dock; faceplate (contacts,
+  # LED) is on local +X, and the approach pad sits on the floor in front.
+  - name: "Charger01"                # USD prim name under /World/ChargingStations/
+    id: "charger_01"                 # logical id, stamped on customData
+    position: [1.6, 12.5, 0.0]      # world XYZ of dock base centre at floor
+    rotation_z_deg: -90.0            # -90 deg yaw (-1.57 rad); faceplate normal points -Y
+    # approach_pad: true             # default; set false to omit the floor plate
 
 output:
   scene_path: "scenes/dp1f_mir.usda"

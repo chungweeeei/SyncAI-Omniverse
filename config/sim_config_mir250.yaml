@@ -18,6 +18,9 @@ robot:
   # scenarios; drive gains in run_sim.py (damping=800, maxForce=40) are
   # tuned for this mass and will need adjustment if it changes substantially.
   mass: 100.0
+  # scale: uniform robot size multiplier (1.0 = real MiR250). Default mass
+  # scales as scale^3 unless `mass` is set explicitly above.
+  scale: 0.7
   # dual_diagonal: two RTX lidars at (±0.38, ±0.26, 0.175), sitting in the
   # 5 cm gap between chassis top (+0.15) and the raised load_plate bottom
   # (+0.20), mirroring real MiR250's corner safety-lidar silhouette. Ghost
@@ -25,6 +28,15 @@ robot:
   # 250° FOV by run_sim.py -- the 110° blind wedges line up with the
   # bearing to the opposite lidar so they don't cross-scan.
   lidar_layout: "dual_diagonal"
+
+charging_stations:
+  # Static MiR250-style rear-docking charging dock. Pure scene prop with a
+  # collidable enclosure + faceplate plus a small floor docking plate. No
+  # ROS2, no motion. See sim_config.yaml for full schema notes.
+  - name: "Charger01"
+    id: "charger_01"
+    position: [1.6, 12.5, 0.0]
+    rotation_z_deg: -90.0
 
 output:
   scene_path: "scenes/dp1f_mir.usda"
