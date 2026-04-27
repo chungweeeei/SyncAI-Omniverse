@@ -61,8 +61,12 @@ from syncai_omniverse.usd._amr_common import (
 def build_auto_door(stage: Usd.Stage, config: dict | None = None) -> str:
     """Author a double-leaf sliding door onto `stage`.
 
-    Config keys (all optional, sensible defaults):
-        name: prim name under /World/Doors/ (default "EastDoor")
+    Config keys:
+        name: prim name under /World/Doors/ (default "EastDoor"). USD-path
+            only; does NOT drive the ROS2 topic naming.
+        id: door id used to derive ROS2 topics (required). Typically
+            "door01", "door02", ... Topics default to
+            /door/<id>/cmd_topic and /door/<id>/state.
         position: [x, y, z] world position of the opening centre at the
             floor (default [8.0, 0.0, 0.0] -- near the +X warehouse wall)
         rotation_z_deg: yaw of the door so it aligns with the host wall
@@ -77,15 +81,26 @@ def build_auto_door(stage: Usd.Stage, config: dict | None = None) -> str:
         open_target: per-leaf slide distance when fully open (default
             opening_width/2 - 0.05 so the leaves don't fully disappear
             into the jambs).
-        topic: ROS2 topic the controller bridge subscribes to
-            (default "/door/<name_lower>/cmd"). Stored as USD customData
-            so `run_sim.py` can discover it via a stage walk -- keeps the
-            USD scene self-describing.
+        cmd_topic: override for the command topic (std_msgs/Bool).
+            Defaults to "/door/<id>/cmd_topic".
+        state_topic: override for the state topic (std_msgs/String).
+            Defaults to "/door/<id>/state".
+
+    Both topics are stored as USD customData (`ros2_cmd_topic`,
+    `ros2_state_topic`, `door_id`) so `run_sim.py` can discover them
+    via a stage walk -- the USD scene stays self-describing.
 
     Returns the door root prim path.
     """
     config = config or {}
     name = config.get("name", "EastDoor")
+    try:
+        door_id = config["id"]
+    except KeyError as exc:
+        raise KeyError(
+            f"door config for name={name!r} is missing required 'id' "
+            f"(used to build /door/<id>/cmd_topic + /door/<id>/state)"
+        ) from exc
     position = config.get("position", [8.0, 0.0, 0.0])
     rotation_z_deg = float(config.get("rotation_z_deg", 0.0))
     opening_width = float(config.get("opening_width", 2.0))
@@ -94,7 +109,8 @@ def build_auto_door(stage: Usd.Stage, config: dict | None = None) -> str:
     leaf_mass = float(config.get("leaf_mass", 25.0))
     default_open = opening_width / 2.0 - 0.05
     open_target = float(config.get("open_target", default_open))
-    topic = config.get("topic", f"/door/{name.lower()}/cmd")
+    cmd_topic = config.get("cmd_topic", f"/door/{door_id}/cmd_topic")
+    state_topic = config.get("state_topic", f"/door/{door_id}/state")
 
     # Ensure the shared container Xform exists. Multiple doors can live
     # under /World/Doors; run_sim.py walks its direct children to attach
@@ -113,11 +129,13 @@ def build_auto_door(stage: Usd.Stage, config: dict | None = None) -> str:
     if rotation_z_deg != 0.0:
         door_xform.AddRotateZOp().Set(rotation_z_deg)
 
-    # Stash the ROS2 topic + open target + closed-position y on the root
-    # as customData. The runtime bridge reads these back so the scene
-    # file is self-describing.
+    # Stash ROS2 topics + open target + door id on the root as customData.
+    # The runtime bridge reads these back so the scene file is
+    # self-describing (run_sim.py walks /World/Doors at launch).
     door_prim = door_xform.GetPrim()
-    door_prim.SetCustomDataByKey("ros2_topic", topic)
+    door_prim.SetCustomDataByKey("door_id", door_id)
+    door_prim.SetCustomDataByKey("ros2_cmd_topic", cmd_topic)
+    door_prim.SetCustomDataByKey("ros2_state_topic", state_topic)
     door_prim.SetCustomDataByKey("open_target", open_target)
 
     # -- Materials --

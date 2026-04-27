@@ -359,21 +359,24 @@ if not args.no_ros2:
             for door in doors_root.GetChildren():
                 name = door.GetName()
                 custom = door.GetCustomData() or {}
-                # Skip prims without the ros2_topic marker -- scene authors
-                # set it from build_auto_door; anything else under
+                # Skip prims without the ros2_cmd_topic marker -- scene
+                # authors set it from build_auto_door; anything else under
                 # /World/Doors is a bystander.
-                if "ros2_topic" not in custom:
+                cmd_topic = custom.get("ros2_cmd_topic")
+                state_topic = custom.get("ros2_state_topic")
+                if cmd_topic is None or state_topic is None:
                     continue
-                topic = custom.get("ros2_topic", f"/door/{name.lower()}/cmd")
                 open_target = float(custom.get("open_target", 0.95))
                 # Doors are shared warehouse infrastructure, not robot-specific.
                 # Keep their topics global (no ROS namespace prefix) so every
-                # AMR in the scene targets the same /door/<name>/cmd. Per-robot
-                # data topics (cmd_vel, odom, scan) still get namespaced above.
+                # AMR in the scene targets the same /door/<id>/cmd_topic.
+                # Per-robot data topics (cmd_vel, odom, scan) still get
+                # namespaced above.
                 attach_door_controller(
                     stage,
                     door_path=str(door.GetPath()),
-                    topic=topic,
+                    cmd_topic=cmd_topic,
+                    state_topic=state_topic,
                     open_target=open_target,
                     namespace="",
                     graph_path=f"/DoorGraph_{name}",

@@ -1,10 +1,12 @@
-"""Attach an OmniGraph that subscribes to std_msgs/Bool on /door/<name>/cmd
-and slides a double-leaf door by writing each leaf's xformOp:translate.
+"""Attach an OmniGraph that subscribes to std_msgs/Bool on /door/<id>/cmd_topic,
+slides a double-leaf door by writing each leaf's xformOp:translate, and
+publishes a std_msgs/String state machine on /door/<id>/state.
 
 Graph shape (on-demand pipeline, fires once per physics substep):
     OnPhysicsStep ──┬─> ROS2Subscriber(std_msgs/Bool)  (dynamic outputs:data)
-                    └─> ScriptNode -- reads sub.data lazily, writes
-                                      kinematic leaf xformOps
+                    └─> ScriptNode -- reads sub.data, slides leaves,
+                                      derives state, publishes /state
+                                      directly via rclpy
 
 Design:
 
@@ -13,8 +15,16 @@ Design:
   outputs matching the message fields -- `outputs:data` (bool) for
   std_msgs/Bool. We read it via og.Controller.attribute().get() inside
   the ScriptNode, NOT via a graph CONNECT (the dynamic output is
-  placeholder-typed at connect time, which causes
-  "cannot connect path to bool" errors).
+  placeholder-typed at connect time).
+
+* The /state publisher is NOT a `ROS2Publisher` OG node. An earlier
+  design wired `DoorScript.outputs:execOut -> PubState.inputs:execIn`
+  and tried to gate the rate by returning False from compute(). In
+  Isaac Sim 5.1 that return value does not suppress downstream exec,
+  so PubState fired every physics tick (~50 Hz) regardless. We now
+  publish directly from the ScriptNode via `rclpy.create_node` +
+  `create_publisher(String, ...)`. Gating lives in pure Python, which
+  gives reliable "on change + 1 Hz heartbeat" behaviour.
 
 * Leaves are kinematic RigidBodies (see `auto_door.py` for rationale).
   Moving them is a USD xformOp:translate write -- PhysX picks up the
@@ -34,6 +44,16 @@ Bool -> leaf target mapping:
     true  -> each leaf interpolates toward its authored open_y
     false -> each leaf interpolates toward its authored closed_y
 
+State (published on /door/<id>/state, std_msgs/String):
+    "closed"   -- last command was false and both leaves at closed_y
+    "opening"  -- last command was true  but not yet at open_y
+    "open"     -- last command was true  and both leaves at open_y
+    "closing"  -- last command was false but not yet at closed_y
+
+Publish policy: on state change (immediate) + 1 Hz heartbeat while
+stable. Subscribers can use "no message for >2 s" as a liveness
+timeout.
+
 Requires Isaac Sim runtime; do not import before `SimulationApp` is up.
 """
 from syncai_omniverse.ros2._ns import apply_namespace as _apply_namespace
@@ -42,8 +62,13 @@ from syncai_omniverse.ros2._ns import apply_namespace as _apply_namespace
 # Runs inside omni.graph.scriptnode.ScriptNode. Module-level globals
 # persist across compute calls.
 _DOOR_SCRIPT = """\
+import time as _time
+
 _state = {
     "sub_attr": None,
+    "ros_node": None,
+    "ros_pub": None,
+    "ros_msg": None,
     "left_prim": None,
     "right_prim": None,
     "left_xform_op": None,
@@ -55,11 +80,19 @@ _state = {
     "leaf_z": 0.0,
     "left_cur_y": 0.0,
     "right_cur_y": 0.0,
+    "last_state": None,
+    "last_pub_time": 0.0,
 }
 
 # Max slide speed (m / physics-tick). At 60 Hz physics, 0.03 m/tick =
 # 1.8 m/s, so a 1.45 m opening completes in ~0.8 s.
 _STEP = 0.03
+# "At target" tolerance for the state machine. Must be < _STEP so a leaf
+# can't simultaneously satisfy "still stepping" and "at target".
+_AT_TARGET_EPS = 1e-4
+# Heartbeat period for /state publishing while the string is unchanged.
+# State transitions bypass this and publish immediately.
+_HEARTBEAT_PERIOD_S = 1.0
 
 
 def setup(db):
@@ -69,6 +102,30 @@ def setup(db):
         _state["sub_attr"] = og.Controller.attribute(str(db.inputs.subAttrPath))
     except Exception:
         _state["sub_attr"] = None
+
+    # Direct rclpy publisher for /state. The isaacsim.ros2.bridge
+    # extension has already initialised rclpy by the time this graph
+    # runs, so we just create our own Node + Publisher and call
+    # publish() from compute(). This gives us reliable Python-side
+    # rate gating instead of relying on OG exec suppression.
+    try:
+        import rclpy
+        from std_msgs.msg import String
+        if not rclpy.ok():
+            rclpy.init()
+        node_name = str(db.inputs.rosNodeName)
+        state_topic = str(db.inputs.stateTopic)
+        _state["ros_node"] = rclpy.create_node(node_name)
+        _state["ros_pub"] = _state["ros_node"].create_publisher(
+            String, state_topic, 10
+        )
+        _state["ros_msg"] = String()
+    except Exception as exc:
+        print(f"[door] rclpy publisher setup failed: {exc}")
+        _state["ros_node"] = None
+        _state["ros_pub"] = None
+        _state["ros_msg"] = None
+
     stage = omni.usd.get_context().get_stage()
     left_path = str(db.inputs.leftPrimPath)
     right_path = str(db.inputs.rightPrimPath)
@@ -135,6 +192,35 @@ def compute(db):
         _state["left_xform_op"].Set(Gf.Vec3d(0.0, _state["left_cur_y"], z))
     if _state["right_xform_op"]:
         _state["right_xform_op"].Set(Gf.Vec3d(0.0, _state["right_cur_y"], z))
+
+    at_closed = (
+        abs(_state["left_cur_y"] - _state["left_closed_y"]) < _AT_TARGET_EPS
+        and abs(_state["right_cur_y"] - _state["right_closed_y"]) < _AT_TARGET_EPS
+    )
+    at_open = (
+        abs(_state["left_cur_y"] - _state["left_open_y"]) < _AT_TARGET_EPS
+        and abs(_state["right_cur_y"] - _state["right_open_y"]) < _AT_TARGET_EPS
+    )
+    if is_open:
+        state_str = "open" if at_open else "opening"
+    else:
+        state_str = "closed" if at_closed else "closing"
+
+    pub = _state["ros_pub"]
+    msg = _state["ros_msg"]
+    now = _time.time()
+    should_publish = (
+        state_str != _state["last_state"]
+        or (now - _state["last_pub_time"]) >= _HEARTBEAT_PERIOD_S
+    )
+    if should_publish and pub is not None and msg is not None:
+        msg.data = state_str
+        try:
+            pub.publish(msg)
+            _state["last_state"] = state_str
+            _state["last_pub_time"] = now
+        except Exception as exc:
+            print(f"[door] publish failed: {exc}")
     return True
 """
 
@@ -142,18 +228,14 @@ def compute(db):
 def attach_door_controller(
     stage,
     door_path: str,
-    topic: str,
+    cmd_topic: str,
+    state_topic: str,
     open_target: float = 0.95,
     namespace: str = "",
     graph_path: str | None = None,
     debug: bool = False,
-    # `left_joint` / `right_joint` kept in the signature for source
-    # compatibility with run_sim.py's current call site; not used now
-    # that the controller writes xformOps directly on the leaves.
-    left_joint: str = "leaf_left_joint",
-    right_joint: str = "leaf_right_joint",
 ) -> str:
-    """Build (or overwrite) the door command graph for one door."""
+    """Build (or overwrite) the door command + state graph for one door."""
     import omni.graph.core as og
 
     door_prim = stage.GetPrimAtPath(door_path)
@@ -166,9 +248,13 @@ def attach_door_controller(
         if not stage.GetPrimAtPath(p).IsValid():
             raise RuntimeError(f"Door leaf prim not found: {p}")
 
-    topic = _apply_namespace(namespace, topic)
+    cmd_topic = _apply_namespace(namespace, cmd_topic)
+    state_topic = _apply_namespace(namespace, state_topic)
     graph_path = graph_path or f"/DoorGraph_{door_prim.GetName()}"
     sub_attr_path = f"{graph_path}/SubBool.outputs:data"
+    # Per-door rclpy node name -- must be unique across doors so multiple
+    # DoorGraph_* in the same process don't collide on the same Node.
+    ros_node_name = f"door_{door_prim.GetName()}_state_pub".replace("/", "_")
 
     create_nodes = [
         ("OnPhysics", "isaacsim.core.nodes.OnPhysicsStep"),
@@ -177,6 +263,8 @@ def attach_door_controller(
     ]
     create_attributes = [
         ("DoorScript.inputs:subAttrPath", "string"),
+        ("DoorScript.inputs:stateTopic", "string"),
+        ("DoorScript.inputs:rosNodeName", "string"),
         ("DoorScript.inputs:leftPrimPath", "string"),
         ("DoorScript.inputs:rightPrimPath", "string"),
     ]
@@ -185,12 +273,14 @@ def attach_door_controller(
         ("OnPhysics.outputs:step", "DoorScript.inputs:execIn"),
     ]
     set_values = [
-        ("SubBool.inputs:topicName", topic),
+        ("SubBool.inputs:topicName", cmd_topic),
         ("SubBool.inputs:messagePackage", "std_msgs"),
         ("SubBool.inputs:messageSubfolder", "msg"),
         ("SubBool.inputs:messageName", "Bool"),
         ("DoorScript.inputs:script", _DOOR_SCRIPT),
         ("DoorScript.inputs:subAttrPath", sub_attr_path),
+        ("DoorScript.inputs:stateTopic", state_topic),
+        ("DoorScript.inputs:rosNodeName", ros_node_name),
         ("DoorScript.inputs:leftPrimPath", left_path),
         ("DoorScript.inputs:rightPrimPath", right_path),
     ]
@@ -209,7 +299,8 @@ def attach_door_controller(
         },
     )
 
-    print(f"[door] graph={graph_path}  topic={topic}  open_target={open_target}")
+    print(f"[door] graph={graph_path}  cmd={cmd_topic}  state={state_topic}  "
+          f"open_target={open_target}")
     print(f"[door]   leaves: {left_path}, {right_path}")
 
     if debug:
