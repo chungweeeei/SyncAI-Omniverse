@@ -6,28 +6,22 @@ stl:
   center_xy: true
   ground_plane_size: [20.0, 30.0]
 
-robot:
-  enabled: true
-  model: "mir250"
-  robot_name: "MirAMR"
-  # Spawn z=0.20 keeps base_link center 0.20m above ground, so wheel bottom
-  # (r=0.10 at local z=-0.10) touches z=0 and chassis bottom sits at z=0.05
-  # (the MiR250 ~50mm ground clearance).
-  spawn_position: [0.0, 0.0, 0.20]
-  # 100 kg approximates MiR250 empty weight (~97 kg). Raise for payload
-  # scenarios; drive gains in run_sim.py (damping=800, maxForce=40) are
-  # tuned for this mass and will need adjustment if it changes substantially.
-  mass: 100.0
-  # scale: uniform robot size multiplier (1.0 = real MiR250). Default mass
-  # scales as scale^3 unless `mass` is set explicitly above.
-  scale: 0.7
-  # dual_diagonal: two RTX lidars at (±0.38, ±0.26, 0.175), sitting in the
-  # 5 cm gap between chassis top (+0.15) and the raised load_plate bottom
-  # (+0.20), mirroring real MiR250's corner safety-lidar silhouette. Ghost
-  # avoidance: front sensor rotated 0°, rear rotated 180°, each cropped to
-  # 250° FOV by run_sim.py -- the 110° blind wedges line up with the
-  # bearing to the opposite lidar so they don't cross-scan.
-  lidar_layout: "dual_diagonal"
+robots:
+  # See sim_config.yaml for full schema documentation.
+  - enabled: true
+    model: "mir250"
+    robot_name: "MirAMR_01"
+    namespace: "robot01"
+    spawn_position: [0.0, 0.0, 0.14]
+    scale: 0.7
+    lidar_layout: "dual_diagonal"
+  - enabled: true
+    model: "mir250"
+    robot_name: "MirAMR_02"
+    namespace: "robot02"
+    spawn_position: [-2.0, 0.0, 0.14]
+    scale: 0.7
+    lidar_layout: "dual_diagonal"
 
 charging_stations:
   # Static MiR250-style rear-docking charging dock. Pure scene prop with a
