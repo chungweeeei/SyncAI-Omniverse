@@ -7,7 +7,6 @@ Run inside the isaac-sim container:
     /isaac-sim/python.sh scripts/run_sim.py --no-ros2       # skip TF setup
 
 Robot models:
-    --robot-model=slotcar   -> /World/SlotCar (default)
     --robot-model=mir250    -> /World/MirAMR (MiR250-style chassis, dual lidar)
 """
 import argparse
@@ -16,24 +15,13 @@ from pathlib import Path
 
 # Per-model defaults. Keys selected by --robot-model; CLI flags still override.
 _MODEL_DEFAULTS = {
-    "slotcar": {
-        "robot_prim": "/World/SlotCar",
-        "scene": "/workspace/scenes/dp1f_slotcar.usda",
-        "wheel_distance": 0.36,
-        "wheel_drive_damping": 200.0,
-        "wheel_drive_max_force": 8.0,
-        "max_linear_accel": 2.5,
-        "max_linear_decel": 2.5,
-        "max_angular_accel": 2.0,
-        "lidar_layout": "single_center",
-        "tf_targets": "lidar_link:scan",
-    },
     "mir250": {
         "robot_prim": "/World/MirAMR",
-        "scene": "/workspace/scenes/dp1f_mir250.usda",
-        # MiR250 is ~10x heavier than SlotCar; scale drive gains up and
-        # ramp accel limits down so the chassis tracks cmd_vel without
-        # startup stall or excessive pitch transient on accel steps.
+        "scene": "/workspace/scenes/dp1f_mir.usda",
+        # MiR250 drive gains / accel limits tuned for the ~100 kg chassis:
+        # enough torque to track cmd_vel without startup stall, but capped
+        # so pitch transient on accel steps stays inside the caster-engage
+        # envelope.
         "wheel_distance": 0.445,
         "wheel_drive_damping": 800.0,
         "wheel_drive_max_force": 40.0,
@@ -48,7 +36,7 @@ _MODEL_DEFAULTS = {
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument(
     "--robot-model",
-    default="slotcar",
+    default="mir250",
     choices=sorted(_MODEL_DEFAULTS),
     help="Which AMR model the scene contains. Selects per-model defaults for "
          "--robot, --scene, wheel distance, drive gains, and lidar layout. "
@@ -63,7 +51,7 @@ parser.add_argument(
     "--robot",
     default=None,
     help="Prim path of the articulation root. Defaults per --robot-model "
-         "(/World/SlotCar or /World/MirAMR).",
+         "(/World/MirAMR).",
 )
 parser.add_argument("--headless", action="store_true", help="Run without a window.")
 parser.add_argument("--no-ros2", action="store_true", help="Skip ROS2 TF publisher setup.")
@@ -72,10 +60,9 @@ parser.add_argument(
     default=None,
     help="Comma-separated link names under --robot to publish (relative to --robot). "
          "Each entry may use `prim:frame_id` to decouple the USD prim from the "
-         "published TF frame id. Defaults per --robot-model (slotcar: "
-         "`lidar_link:scan`; mir250: `lidar_link_front:scan_front,"
-         "lidar_link_rear:scan_rear`). Use 'auto' for every rigid-body child link "
-         "(prim name == frame id).",
+         "published TF frame id. Default per --robot-model (mir250: "
+         "`lidar_link_front:scan_front,lidar_link_rear:scan_rear`). Use 'auto' "
+         "for every rigid-body child link (prim name == frame id).",
 )
 parser.add_argument(
     "--no-clock",
@@ -110,6 +97,11 @@ parser.add_argument(
     "--no-lidar",
     action="store_true",
     help="Skip RTX lidar + /scan publisher.",
+)
+parser.add_argument(
+    "--no-doors",
+    action="store_true",
+    help="Skip attaching ROS2 controllers for /World/Doors/* articulations.",
 )
 parser.add_argument(
     "--lidar-debug-draw",
@@ -148,7 +140,7 @@ parser.add_argument(
     "--lidar-parent",
     default=None,
     help="For single_center layouts, link name under --robot to parent the "
-         "RTX lidar to. Defaults: slotcar=`lidar_link`. Ignored for dual_diagonal "
+         "RTX lidar to. Default: `lidar_link`. Ignored for dual_diagonal "
          "(both mount points are hard-coded to `lidar_link_front` + "
          "`lidar_link_rear`).",
 )
@@ -355,6 +347,41 @@ if not args.no_ros2:
             for prim_path in lidar_prims:
                 attach_lidar_debug_draw(prim_path)
 
+    if not args.no_doors:
+        from syncai_omniverse.ros2.door_controller import attach_door_controller
+
+        # Walk /World/Doors and attach one controller graph per door. Topic
+        # and open-target are read from each door's USD customData (authored
+        # by `auto_door.build_auto_door`), so run_sim.py needs no per-door
+        # CLI plumbing and the scene stays self-describing.
+        doors_root = stage.GetPrimAtPath("/World/Doors")
+        if doors_root and doors_root.IsValid():
+            for door in doors_root.GetChildren():
+                name = door.GetName()
+                custom = door.GetCustomData() or {}
+                # Skip prims without the ros2_cmd_topic marker -- scene
+                # authors set it from build_auto_door; anything else under
+                # /World/Doors is a bystander.
+                cmd_topic = custom.get("ros2_cmd_topic")
+                state_topic = custom.get("ros2_state_topic")
+                if cmd_topic is None or state_topic is None:
+                    continue
+                open_target = float(custom.get("open_target", 0.95))
+                # Doors are shared warehouse infrastructure, not robot-specific.
+                # Keep their topics global (no ROS namespace prefix) so every
+                # AMR in the scene targets the same /door/<id>/cmd_topic.
+                # Per-robot data topics (cmd_vel, odom, scan) still get
+                # namespaced above.
+                attach_door_controller(
+                    stage,
+                    door_path=str(door.GetPath()),
+                    cmd_topic=cmd_topic,
+                    state_topic=state_topic,
+                    open_target=open_target,
+                    namespace="",
+                    graph_path=f"/DoorGraph_{name}",
+                )
+
 omni.timeline.get_timeline_interface().play()
 
 
@@ -404,9 +431,9 @@ def _pose_probe_factory(robot_path: str):
             return None, None, None
         try:
             # `isaacsim.core.prims.Articulation` requires the pattern to match
-            # a prim with both RigidBodyAPI and ArticulationRootAPI. Both
-            # SlotCar and MirAMR put ArticulationRootAPI on `base_link`, not
-            # on the `/World/<Robot>` Xform, so we descend explicitly.
+            # a prim with both RigidBodyAPI and ArticulationRootAPI. MirAMR
+            # puts ArticulationRootAPI on `base_link`, not on the
+            # `/World/<Robot>` Xform, so we descend explicitly.
             art_root_path = _find_articulation_root(stage_, robot_path)
             art = Articulation(prim_paths_expr=art_root_path)
             # `initialize` binds the view to the live PhysX articulation; it

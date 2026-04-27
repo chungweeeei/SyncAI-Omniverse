@@ -96,7 +96,10 @@ def _add_sphere(stage, path: str, radius: float, material, collision: bool,
 def _fixed_joint(stage, path: str, body0: str, body1: str,
                  local_pos0, local_pos1):
     joint = UsdPhysics.FixedJoint.Define(stage, path)
-    joint.CreateBody0Rel().SetTargets([Sdf.Path(body0)])
+    # Empty body0 -> anchored to the inertial world frame; skip SetTargets
+    # because passing Sdf.Path("") errors with "Cannot map <> to layer".
+    if body0:
+        joint.CreateBody0Rel().SetTargets([Sdf.Path(body0)])
     joint.CreateBody1Rel().SetTargets([Sdf.Path(body1)])
     joint.CreateLocalPos0Attr().Set(Gf.Vec3f(*local_pos0))
     joint.CreateLocalRot0Attr().Set(Gf.Quatf(1.0))
@@ -135,6 +138,48 @@ def _revolute_joint(stage, path: str, body0: str, body1: str,
         drive.CreateDampingAttr(drive_damping)
         drive.CreateMaxForceAttr(drive_max_force)
         drive.CreateTargetVelocityAttr(0.0)
+    return joint
+
+
+def _prismatic_joint(stage, path: str, body0: str, body1: str,
+                     local_pos0, local_pos1, axis: str = "Y",
+                     lower_limit: float | None = None,
+                     upper_limit: float | None = None,
+                     add_drive: bool = False,
+                     drive_type: str = "force",
+                     drive_stiffness: float = 500.0,
+                     drive_damping: float = 50.0,
+                     drive_max_force: float = 200.0,
+                     target_position: float = 0.0):
+    joint = UsdPhysics.PrismaticJoint.Define(stage, path)
+    # Empty body0 -> anchored to the inertial world frame. USD Physics
+    # treats a missing body0 relationship target as "world", so we only
+    # set the target when a prim path is actually supplied.
+    if body0:
+        joint.CreateBody0Rel().SetTargets([Sdf.Path(body0)])
+    joint.CreateBody1Rel().SetTargets([Sdf.Path(body1)])
+    joint.CreateLocalPos0Attr().Set(Gf.Vec3f(*local_pos0))
+    joint.CreateLocalRot0Attr().Set(Gf.Quatf(1.0))
+    joint.CreateLocalPos1Attr().Set(Gf.Vec3f(*local_pos1))
+    joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0))
+    joint.CreateAxisAttr(axis)
+    if lower_limit is not None:
+        joint.CreateLowerLimitAttr(lower_limit)
+    if upper_limit is not None:
+        joint.CreateUpperLimitAttr(upper_limit)
+    if add_drive:
+        # Position-mode linear drive (stiffness>0, damping>0): PhysX computes
+        # force = stiffness * (targetPosition - pos) + damping * (targetVel - vel),
+        # clamped by maxForce. Use for doors / lifts where the joint must hold
+        # a commanded pose under disturbance. Velocity mode (like wheels) sets
+        # stiffness=0 and lets the controller choose vel directly -- not what
+        # we want for a door that needs to stop at the jamb and stay there.
+        drive = UsdPhysics.DriveAPI.Apply(joint.GetPrim(), "linear")
+        drive.CreateTypeAttr(drive_type)
+        drive.CreateStiffnessAttr(drive_stiffness)
+        drive.CreateDampingAttr(drive_damping)
+        drive.CreateMaxForceAttr(drive_max_force)
+        drive.CreateTargetPositionAttr(target_position)
     return joint
 
 

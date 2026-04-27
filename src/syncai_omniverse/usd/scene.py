@@ -3,21 +3,20 @@ import os
 from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics, UsdShade
 
 from syncai_omniverse.usd.stl_to_usd import build_warehouse
-from syncai_omniverse.usd.slot_car import build_slotcar
 from syncai_omniverse.usd.mir_amr import build_mir_amr
+from syncai_omniverse.usd.auto_door import build_auto_door
 
 
 # Registry of available robot model builders. `robot.model` in sim_config.yaml
 # selects which one runs. Add entries here when adding a new AMR module.
 _BUILDERS = {
-    "slotcar": build_slotcar,
     "mir250": build_mir_amr,
 }
 
 
 def _build_robot(stage, robot_cfg: dict) -> str:
     """Dispatch to the correct robot builder based on `robot_cfg["model"]`."""
-    model = robot_cfg.get("model", "slotcar")
+    model = robot_cfg.get("model", "mir250")
     if model not in _BUILDERS:
         raise ValueError(
             f"Unknown robot.model={model!r}; expected one of {sorted(_BUILDERS)}"
@@ -31,9 +30,9 @@ def build_combined_scene(output_path: str, stl_path: str, config: dict) -> str:
 
         `config["stl"]`: warehouse build options (scale, center_xy, ground_plane_size).
         `config["robot"]` (optional): robot build options
-            {enabled: bool, model: "slotcar"|"mir250", robot_name: str,
+            {enabled: bool, model: "mir250", robot_name: str,
              spawn_position: [x, y, z], mass: float}.
-            Defaults to enabled=True, model=slotcar.
+            Defaults to enabled=True, model=mir250.
     """
     stage = _new_stage(output_path)
     build_warehouse(stage, stl_path, config["stl"])
@@ -41,6 +40,9 @@ def build_combined_scene(output_path: str, stl_path: str, config: dict) -> str:
     robot_cfg = config.get("robot", {}) or {}
     if robot_cfg.get("enabled", True):
         _build_robot(stage, robot_cfg)
+
+    for door_cfg in config.get("doors") or []:
+        build_auto_door(stage, door_cfg)
 
     stage.GetRootLayer().Save()
     return output_path
@@ -65,6 +67,9 @@ def build_robot_only_scene(output_path: str, config: dict) -> str:
     robot_cfg = config.get("robot", {}) or {}
     if robot_cfg.get("enabled", True):
         _build_robot(stage, robot_cfg)
+
+    for door_cfg in config.get("doors") or []:
+        build_auto_door(stage, door_cfg)
 
     stage.GetRootLayer().Save()
     return output_path
