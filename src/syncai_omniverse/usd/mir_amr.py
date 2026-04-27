@@ -36,8 +36,16 @@ def build_mir_amr(stage: Usd.Stage, config: dict | None = None) -> str:
 
     Config keys:
         robot_name: str -- defaults to "MirAMR"
-        spawn_position: [x, y, z] -- defaults to [0, 0, 0.20]
-        mass: float -- base_link mass in kg, defaults to 100.0
+        spawn_position: [x, y, z] -- defaults to [0, 0, 0.20 * scale]
+        scale: float -- uniform size multiplier, defaults to 1.0. All
+            linear dimensions (chassis, wheel radius, joint offsets, etc.)
+            are multiplied by `scale`; default mass scales as scale^3
+            (preserves density) and default inertias as scale^5 (preserves
+            m * r^2). Drive damping / max_force are NOT auto-scaled --
+            override via `wheel_drive_damping` and `wheel_drive_max_force`
+            if the robot stops responding cleanly to cmd_vel after scaling.
+        mass: float -- base_link mass in kg. Defaults to 100.0 * scale^3
+            so density stays constant; pass explicitly to override.
         wheel_drive_damping: float -- defaults to 800.0
         wheel_drive_max_force: float -- defaults to 40.0 N*m
 
@@ -45,8 +53,11 @@ def build_mir_amr(stage: Usd.Stage, config: dict | None = None) -> str:
     """
     config = config or {}
     robot_name = config.get("robot_name", "MirAMR")
-    spawn_position = config.get("spawn_position", [0.0, 0.0, 0.20])
-    base_mass = float(config.get("mass", 100.0))
+    s = float(config.get("scale", 1.0))   # uniform linear size multiplier
+    s3 = s ** 3                            # mass scaling (volume)
+    s5 = s ** 5                            # inertia scaling (m * r^2)
+    spawn_position = config.get("spawn_position", [0.0, 0.0, 0.20 * s])
+    base_mass = float(config.get("mass", 100.0 * s3))
     drive_damping = float(config.get("wheel_drive_damping", 800.0))
     drive_max_force = float(config.get("wheel_drive_max_force", 40.0))
 
@@ -85,9 +96,9 @@ def build_mir_amr(stage: Usd.Stage, config: dict | None = None) -> str:
             attr_name, Sdf.ValueTypeNames.Float
         ).Set(value)
     _add_box(stage, f"{robot_path}/base_link/visual",
-             size=(0.80, 0.58, 0.30), material=body_mat, collision=False)
+             size=(0.80*s, 0.58*s, 0.30*s), material=body_mat, collision=False)
     _add_box(stage, f"{robot_path}/base_link/collision",
-             size=(0.80, 0.58, 0.30), material=None, collision=True)
+             size=(0.80*s, 0.58*s, 0.30*s), material=None, collision=True)
     UsdPhysics.MassAPI.Apply(base_link.GetPrim()).CreateMassAttr(base_mass)
 
     # -- load_plate : thin cosmetic top deck, visual only, no rigid body --
@@ -99,40 +110,42 @@ def build_mir_amr(stage: Usd.Stage, config: dict | None = None) -> str:
     # silhouette as a real MiR250 where the LS-140/R2000 sensors peek out
     # of a cosmetic notch between the shell and the body.
     plate_xf = UsdGeom.Xform.Define(stage, f"{robot_path}/base_link/load_plate")
-    plate_xf.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.21))
+    plate_xf.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.21*s))
     _add_box(stage, f"{robot_path}/base_link/load_plate/visual",
-             size=(0.78, 0.56, 0.02), material=plate_mat, collision=False)
+             size=(0.78*s, 0.56*s, 0.02*s), material=plate_mat, collision=False)
 
     # -- base_footprint : inertial body 0.20m below base_link (ROS footprint frame) --
     footprint = _define_rigid_link(stage, f"{robot_path}/base_footprint",
-                                   translate=(0.0, 0.0, -0.20))
-    _apply_mass(footprint.GetPrim(), mass=1.0, inertia=(0.1, 0.1, 0.1))
+                                   translate=(0.0, 0.0, -0.20*s))
+    _apply_mass(footprint.GetPrim(), mass=1.0*s3, inertia=(0.1*s5, 0.1*s5, 0.1*s5))
 
     # -- drivewhl_l_link : cylinder visual + SPHERE collider at (0, +0.2225, -0.10) --
     # Sphere collider (r=0.10): PhysX natively supports spheres so rolling
     # contact is symmetric. A flat cylinder collider would be faceted into
     # a convex hull polygon, locking reverse slip. Same lesson as SlotCar.
     left_wheel = _define_rigid_link(stage, f"{robot_path}/drivewhl_l_link",
-                                    translate=(0.0, 0.2225, -0.10))
+                                    translate=(0.0, 0.2225*s, -0.10*s))
     _add_cylinder(stage, f"{robot_path}/drivewhl_l_link/visual",
-                  radius=0.10, height=0.05, rotate_xyz=(90.0, 0.0, 0.0),
+                  radius=0.10*s, height=0.05*s, rotate_xyz=(90.0, 0.0, 0.0),
                   material=wheel_mat, collision=False)
     _add_sphere(stage, f"{robot_path}/drivewhl_l_link/collision",
-                radius=0.10, material=None, collision=True,
+                radius=0.10*s, material=None, collision=True,
                 physics_material=wheel_phys)
     # Spin axis Y: Iyy = 0.5*m*r^2 = 0.01 (spin); Ixx = Izz = (1/12)*m*(3r^2+h^2) = 0.00542
-    _apply_mass(left_wheel.GetPrim(), mass=2.0, inertia=(0.00542, 0.01, 0.00542))
+    _apply_mass(left_wheel.GetPrim(), mass=2.0*s3,
+                inertia=(0.00542*s5, 0.01*s5, 0.00542*s5))
 
     # -- drivewhl_r_link : mirror at (0, -0.2225, -0.10) --
     right_wheel = _define_rigid_link(stage, f"{robot_path}/drivewhl_r_link",
-                                     translate=(0.0, -0.2225, -0.10))
+                                     translate=(0.0, -0.2225*s, -0.10*s))
     _add_cylinder(stage, f"{robot_path}/drivewhl_r_link/visual",
-                  radius=0.10, height=0.05, rotate_xyz=(90.0, 0.0, 0.0),
+                  radius=0.10*s, height=0.05*s, rotate_xyz=(90.0, 0.0, 0.0),
                   material=wheel_mat, collision=False)
     _add_sphere(stage, f"{robot_path}/drivewhl_r_link/collision",
-                radius=0.10, material=None, collision=True,
+                radius=0.10*s, material=None, collision=True,
                 physics_material=wheel_phys)
-    _apply_mass(right_wheel.GetPrim(), mass=2.0, inertia=(0.00542, 0.01, 0.00542))
+    _apply_mass(right_wheel.GetPrim(), mass=2.0*s3,
+                inertia=(0.00542*s5, 0.01*s5, 0.00542*s5))
 
     # -- Four corner casters, all frictionless --
     # Real MiR250 has 4 swivel casters at the chassis corners. Here we fix
@@ -159,21 +172,21 @@ def build_mir_amr(stage: Usd.Stage, config: dict | None = None) -> str:
     # wheels spun but chassis didn't translate. Same symptom as in
     # `feedback_diff_drive_single_caster` but with 4 casters instead of 2.)
     caster_positions = {
-        "caster_fl_link": (0.36, 0.24, -0.15),   # front-left
-        "caster_fr_link": (0.36, -0.24, -0.15),  # front-right
-        "caster_rl_link": (-0.36, 0.24, -0.15),  # rear-left
-        "caster_rr_link": (-0.36, -0.24, -0.15), # rear-right
+        "caster_fl_link": (0.36*s, 0.24*s, -0.15*s),   # front-left
+        "caster_fr_link": (0.36*s, -0.24*s, -0.15*s),  # front-right
+        "caster_rl_link": (-0.36*s, 0.24*s, -0.15*s),  # rear-left
+        "caster_rr_link": (-0.36*s, -0.24*s, -0.15*s), # rear-right
     }
     for name, pos in caster_positions.items():
         link = _define_rigid_link(stage, f"{robot_path}/{name}", translate=pos)
         _add_sphere(stage, f"{robot_path}/{name}/visual",
-                    radius=0.04, material=caster_mat, collision=False)
+                    radius=0.04*s, material=caster_mat, collision=False)
         _add_sphere(stage, f"{robot_path}/{name}/collision",
-                    radius=0.04, material=None, collision=True,
+                    radius=0.04*s, material=None, collision=True,
                     physics_material=frictionless)
         # Solid sphere inertia: I = (2/5)*m*r^2 = 0.000192, symmetric
-        _apply_mass(link.GetPrim(), mass=0.3,
-                    inertia=(0.000192, 0.000192, 0.000192))
+        _apply_mass(link.GetPrim(), mass=0.3*s3,
+                    inertia=(0.000192*s5, 0.000192*s5, 0.000192*s5))
 
     # -- lidar_link_front : front-left mount point for RTX lidar #1 --
     # No visual / no collider: the RTX sensor's vendor model (loaded at
@@ -192,13 +205,15 @@ def build_mir_amr(stage: Usd.Stage, config: dict | None = None) -> str:
     # 250° so the 110° blind wedge covers the bearing to the opposite
     # lidar. Net union coverage is still 360° (70° side overlap).
     lidar_front = _define_rigid_link(stage, f"{robot_path}/lidar_link_front",
-                                     translate=(0.38, 0.26, 0.175))
-    _apply_mass(lidar_front.GetPrim(), mass=0.1, inertia=(0.00004, 0.00004, 0.00004))
+                                     translate=(0.38*s, 0.26*s, 0.175*s))
+    _apply_mass(lidar_front.GetPrim(), mass=0.1*s3,
+                inertia=(0.00004*s5, 0.00004*s5, 0.00004*s5))
 
     # -- lidar_link_rear : rear-right mount point for RTX lidar #2 --
     lidar_rear = _define_rigid_link(stage, f"{robot_path}/lidar_link_rear",
-                                    translate=(-0.38, -0.26, 0.175))
-    _apply_mass(lidar_rear.GetPrim(), mass=0.1, inertia=(0.00004, 0.00004, 0.00004))
+                                    translate=(-0.38*s, -0.26*s, 0.175*s))
+    _apply_mass(lidar_rear.GetPrim(), mass=0.1*s3,
+                inertia=(0.00004*s5, 0.00004*s5, 0.00004*s5))
 
     # -- Joints --
     joints_path = f"{robot_path}/joints"
@@ -207,12 +222,12 @@ def build_mir_amr(stage: Usd.Stage, config: dict | None = None) -> str:
     _fixed_joint(stage, f"{joints_path}/base_joint",
                  body0=f"{robot_path}/base_link",
                  body1=f"{robot_path}/base_footprint",
-                 local_pos0=(0.0, 0.0, -0.20), local_pos1=(0.0, 0.0, 0.0))
+                 local_pos0=(0.0, 0.0, -0.20*s), local_pos1=(0.0, 0.0, 0.0))
 
     _revolute_joint(stage, f"{joints_path}/drivewhl_l_joint",
                     body0=f"{robot_path}/base_link",
                     body1=f"{robot_path}/drivewhl_l_link",
-                    local_pos0=(0.0, 0.2225, -0.10), local_pos1=(0.0, 0.0, 0.0),
+                    local_pos0=(0.0, 0.2225*s, -0.10*s), local_pos1=(0.0, 0.0, 0.0),
                     axis="Y", add_drive=True,
                     drive_damping=drive_damping,
                     drive_max_force=drive_max_force)
@@ -220,7 +235,7 @@ def build_mir_amr(stage: Usd.Stage, config: dict | None = None) -> str:
     _revolute_joint(stage, f"{joints_path}/drivewhl_r_joint",
                     body0=f"{robot_path}/base_link",
                     body1=f"{robot_path}/drivewhl_r_link",
-                    local_pos0=(0.0, -0.2225, -0.10), local_pos1=(0.0, 0.0, 0.0),
+                    local_pos0=(0.0, -0.2225*s, -0.10*s), local_pos1=(0.0, 0.0, 0.0),
                     axis="Y", add_drive=True,
                     drive_damping=drive_damping,
                     drive_max_force=drive_max_force)
@@ -235,11 +250,11 @@ def build_mir_amr(stage: Usd.Stage, config: dict | None = None) -> str:
     _fixed_joint(stage, f"{joints_path}/lidar_joint_front",
                  body0=f"{robot_path}/base_link",
                  body1=f"{robot_path}/lidar_link_front",
-                 local_pos0=(0.38, 0.26, 0.175), local_pos1=(0.0, 0.0, 0.0))
+                 local_pos0=(0.38*s, 0.26*s, 0.175*s), local_pos1=(0.0, 0.0, 0.0))
 
     _fixed_joint(stage, f"{joints_path}/lidar_joint_rear",
                  body0=f"{robot_path}/base_link",
                  body1=f"{robot_path}/lidar_link_rear",
-                 local_pos0=(-0.38, -0.26, 0.175), local_pos1=(0.0, 0.0, 0.0))
+                 local_pos0=(-0.38*s, -0.26*s, 0.175*s), local_pos1=(0.0, 0.0, 0.0))
 
     return robot_path

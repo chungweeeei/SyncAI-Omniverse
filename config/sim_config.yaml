@@ -6,17 +6,42 @@ stl:
   center_xy: true
   ground_plane_size: [20.0, 30.0]
 
-robot:
-  enabled: true
-  # model: which AMR to spawn. Currently only "mir250" is supported.
-  model: "mir250"
-  robot_name: "MirAMR"
-  spawn_position: [0.0, 0.0, 0.20]
-  # mass: base_link mass in kg (mir250 default = 100 kg)
-  mass: 100.0
-  # lidar_layout: "dual_diagonal" publishes /scan_front + /scan_rear on two
-  # RTX lidars (mir250 default). "single_center" runs one /scan.
-  lidar_layout: "dual_diagonal"
+robots:
+  # Each entry spawns one MiR250 under /World/<robot_name> with its own
+  # ROS2 namespace. run_sim.py loops over this list at startup and attaches
+  # per-robot tf/odom/cmd_vel/lidar bridges with namespaced OmniGraph paths
+  # (e.g. /robot01/CmdVelActionGraph). Clock is shared across robots.
+  #
+  # Per-entry keys:
+  #   enabled          : bool. Skip if false.
+  #   model            : "mir250" (only model supported today).
+  #   robot_name       : USD prim name (must be unique per stage).
+  #   namespace        : ROS2 namespace (e.g. "robot01"). Drives topic prefix
+  #                      and per-robot OmniGraph paths.
+  #   spawn_position   : [x, y, z]. z must equal 0.20 * scale so wheels
+  #                      touch ground (chassis floats otherwise).
+  #   scale            : uniform robot size multiplier (1.0 = real MiR250).
+  #                      Linear dims x scale, default mass x scale^3, default
+  #                      inertias x scale^5. Wheel radius / track width are
+  #                      auto-derived in run_sim.py from this scale.
+  #   lidar_layout     : "dual_diagonal" (two RTX lidars publishing
+  #                      <ns>/scan_front + <ns>/scan_rear) or "single_center".
+  #   mass (optional)  : Override base_link mass. If omitted, scale^3 default
+  #                      keeps chassis:wheel ratio near 50:1 (PhysX stable).
+  - enabled: true
+    model: "mir250"
+    robot_name: "MirAMR_01"
+    namespace: "robot01"
+    spawn_position: [0.0, 0.0, 0.14]
+    scale: 0.7
+    lidar_layout: "dual_diagonal"
+  - enabled: true
+    model: "mir250"
+    robot_name: "MirAMR_02"
+    namespace: "robot02"
+    spawn_position: [0.0, 5.0, 0.14]
+    scale: 0.7
+    lidar_layout: "dual_diagonal"
 
 doors:
   # Automatic sliding doors. Each entry becomes kinematic leaves under
@@ -35,6 +60,18 @@ doors:
     leaf_mass: 25.0
     # open_target omitted -> auto = opening_width/2 - 0.05 = 1.2 m per leaf
     # cmd_topic / state_topic optional; default from id
+
+charging_stations:
+  # Static MiR250-style rear-docking charging dock. Pure scene prop with a
+  # collidable enclosure + faceplate plus a small floor docking plate. No
+  # ROS2, no motion. Each entry becomes /World/ChargingStations/<name>.
+  # Robot reverses along the prop's local -X to dock; faceplate (contacts,
+  # LED) is on local +X, and the approach pad sits on the floor in front.
+  - name: "Charger01"                # USD prim name under /World/ChargingStations/
+    id: "charger_01"                 # logical id, stamped on customData
+    position: [1.6, 12.5, 0.0]      # world XYZ of dock base centre at floor
+    rotation_z_deg: -90.0            # -90 deg yaw (-1.57 rad); faceplate normal points -Y
+    # approach_pad: true             # default; set false to omit the floor plate
 
 output:
   scene_path: "scenes/dp1f_mir.usda"

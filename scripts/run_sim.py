@@ -1,28 +1,35 @@
-"""Launch Isaac Sim, open a scene USD, and attach the ROS2 TF publisher.
+"""Launch Isaac Sim, open a scene USD, and attach ROS2 bridges per robot.
 
 Run inside the isaac-sim container:
     /isaac-sim/python.sh scripts/run_sim.py
     /isaac-sim/python.sh scripts/run_sim.py --scene /workspace/scenes/warehouse.usda
     /isaac-sim/python.sh scripts/run_sim.py --headless
-    /isaac-sim/python.sh scripts/run_sim.py --no-ros2       # skip TF setup
+    /isaac-sim/python.sh scripts/run_sim.py --no-ros2
 
-Robot models:
-    --robot-model=mir250    -> /World/MirAMR (MiR250-style chassis, dual lidar)
+Multi-robot: this script reads `config/sim_config.yaml` at startup and loops
+the per-robot attach (tf, odom, cmd_vel, lidar) over every entry under
+`robots:`. Each robot gets a namespaced topic tree (e.g. /robot01/cmd_vel)
+and namespaced OmniGraph paths (e.g. /robot01/CmdVelActionGraph) so two or
+more robots can coexist in the same stage without prim collisions. Clock
+and doors stay as stage-wide singletons.
 """
 import argparse
 import sys
 from pathlib import Path
 
-# Per-model defaults. Keys selected by --robot-model; CLI flags still override.
+import yaml
+
+# Per-model defaults. wheel_radius / wheel_distance are auto-derived from
+# each robot's `scale` (see _resolve_robot_runtime below) so they don't need
+# to be re-stated here when scale changes.
 _MODEL_DEFAULTS = {
     "mir250": {
-        "robot_prim": "/World/MirAMR",
         "scene": "/workspace/scenes/dp1f_mir.usda",
         # MiR250 drive gains / accel limits tuned for the ~100 kg chassis:
         # enough torque to track cmd_vel without startup stall, but capped
         # so pitch transient on accel steps stays inside the caster-engage
-        # envelope.
-        "wheel_distance": 0.445,
+        # envelope. Override per robot via `wheel_drive_*` keys in YAML if
+        # a non-default scale needs different gains.
         "wheel_drive_damping": 800.0,
         "wheel_drive_max_force": 40.0,
         "max_linear_accel": 1.0,
@@ -30,28 +37,86 @@ _MODEL_DEFAULTS = {
         "max_angular_accel": 1.5,
         "lidar_layout": "dual_diagonal",
         "tf_targets": "lidar_link_front:scan_front,lidar_link_rear:scan_rear",
+        # Real MiR250 unscaled geometry; the actual values used at runtime
+        # are these * the per-robot `scale`.
+        "wheel_radius_unscaled": 0.10,
+        "wheel_distance_unscaled": 0.445,
     },
 }
+
+
+def _load_sim_config(scene_path: Path) -> dict:
+    """Locate and load sim_config.yaml.
+
+    Looks next to the scene (../config relative to scenes/) and falls back
+    to the project's config dir derived from this script's location.
+    """
+    candidates = [
+        scene_path.resolve().parent.parent / "config" / "sim_config.yaml",
+        Path(__file__).resolve().parent.parent / "config" / "sim_config.yaml",
+    ]
+    for p in candidates:
+        if p.exists():
+            with open(p) as f:
+                return yaml.safe_load(f) or {}
+    raise SystemExit(f"sim_config.yaml not found; searched: {candidates}")
+
+
+def _resolve_robot_runtime(robot_cfg: dict, model: str) -> dict:
+    """Merge YAML per-robot keys with model defaults; derive wheel geometry.
+
+    `wheel_radius` and `wheel_distance` are auto-computed from the robot's
+    `scale` so the YAML stays a single source of truth (mismatches between
+    scale and these values cause cmd_vel to track at the wrong velocity --
+    a bug we hit while iterating on per-robot scale).
+    """
+    if model not in _MODEL_DEFAULTS:
+        raise SystemExit(f"Unknown model={model!r}; expected {sorted(_MODEL_DEFAULTS)}")
+    md = _MODEL_DEFAULTS[model]
+    s = float(robot_cfg.get("scale", 1.0))
+    namespace = robot_cfg.get("namespace", "") or ""
+    robot_name = robot_cfg["robot_name"]
+    return {
+        "robot_name": robot_name,
+        "namespace": namespace,
+        "robot_path": f"/World/{robot_name}",
+        "scale": s,
+        "wheel_radius": md["wheel_radius_unscaled"] * s,
+        "wheel_distance": md["wheel_distance_unscaled"] * s,
+        "wheel_drive_damping": float(robot_cfg.get(
+            "wheel_drive_damping", md["wheel_drive_damping"])),
+        "wheel_drive_max_force": float(robot_cfg.get(
+            "wheel_drive_max_force", md["wheel_drive_max_force"])),
+        "max_linear_accel": md["max_linear_accel"],
+        "max_linear_decel": md["max_linear_decel"],
+        "max_angular_accel": md["max_angular_accel"],
+        "lidar_layout": robot_cfg.get("lidar_layout", md["lidar_layout"]),
+        "tf_targets": robot_cfg.get("tf_targets", md["tf_targets"]),
+        "model": model,
+    }
+
+
+def _graph_path(namespace: str, suffix: str) -> str:
+    """Build a namespaced OmniGraph path. Suffix is e.g. 'CmdVelActionGraph'.
+
+    Hardcoded defaults inside attach_* functions would collide if called
+    twice; namespacing the graph path is what lets two robots share a stage.
+    """
+    return f"/{namespace}/{suffix}" if namespace else f"/{suffix}"
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument(
     "--robot-model",
     default="mir250",
     choices=sorted(_MODEL_DEFAULTS),
-    help="Which AMR model the scene contains. Selects per-model defaults for "
-         "--robot, --scene, wheel distance, drive gains, and lidar layout. "
-         "Individual CLI flags still override these.",
+    help="AMR model the scene was built from. Drives drive gains, accel "
+         "limits, default lidar layout, and unscaled wheel geometry. "
+         "Per-robot scale / namespace still come from sim_config.yaml.",
 )
 parser.add_argument(
     "--scene",
     default=None,
     help="Path to the USD stage to open. Defaults per --robot-model.",
-)
-parser.add_argument(
-    "--robot",
-    default=None,
-    help="Prim path of the articulation root. Defaults per --robot-model "
-         "(/World/MirAMR).",
 )
 parser.add_argument("--headless", action="store_true", help="Run without a window.")
 parser.add_argument("--no-ros2", action="store_true", help="Skip ROS2 TF publisher setup.")
@@ -151,34 +216,26 @@ parser.add_argument(
          "header. Ignored for dual_diagonal (frames are `scan_front` + `scan_rear`).",
 )
 parser.add_argument(
-    "--ros-namespace",
-    default="",
-    help="ROS2 namespace prepended to data topics (cmd_vel, odom, joint_states, "
-         "scan). /tf and /tf_static stay global so nav2/rviz can discover the "
-         "TF tree without extra remapping. Empty string = no namespace.",
-)
-parser.add_argument(
     "--cmd-vel-topic",
     default="/cmd_vel_smoothed",
-    help="Topic the sim subscribes to for Twist commands. Defaults to the nav2 "
-         "velocity_smoother output. Several nav2 publishers (controller_server + "
-         "each BT recovery action) race on raw /cmd_vel, producing a 0/v sawtooth "
-         "that our wheel drive can't integrate. Override to /cmd_vel when running "
-         "without nav2 (e.g. raw teleop_twist_keyboard).",
+    help="Topic suffix the sim subscribes to for Twist commands (per-robot "
+         "namespace is auto-prepended). Defaults to the nav2 velocity_smoother "
+         "output. Several nav2 publishers race on raw /cmd_vel, producing a "
+         "0/v sawtooth our wheel drive can't integrate. Override to "
+         "/cmd_vel when running without nav2 (e.g. raw teleop_twist_keyboard).",
+)
+parser.add_argument(
+    "--debug-pose-robot",
+    default=None,
+    help="`robot_name` whose base_link to probe for --debug-pose. Defaults "
+         "to the first enabled robot in sim_config.yaml.",
 )
 args = parser.parse_args()
 
-# Resolve per-model defaults. CLI flags override; unset flags inherit from
-# _MODEL_DEFAULTS[args.robot_model].
+# Resolve scene path + load YAML to discover the per-robot list.
 _model_cfg = _MODEL_DEFAULTS[args.robot_model]
 if args.scene is None:
     args.scene = _model_cfg["scene"]
-if args.robot is None:
-    args.robot = _model_cfg["robot_prim"]
-if args.tf_targets is None:
-    args.tf_targets = _model_cfg["tf_targets"]
-if args.lidar_layout is None:
-    args.lidar_layout = _model_cfg["lidar_layout"]
 if args.lidar_parent is None:
     # Only used for single_center; dual_diagonal hard-codes both mount points.
     args.lidar_parent = "lidar_link"
@@ -186,6 +243,38 @@ if args.lidar_parent is None:
 scene_path = Path(args.scene).resolve()
 if not scene_path.exists():
     raise SystemExit(f"Scene not found: {scene_path}")
+
+_sim_cfg = _load_sim_config(scene_path)
+_robot_entries = _sim_cfg.get("robots") or (
+    [_sim_cfg["robot"]] if _sim_cfg.get("robot") else []
+)
+_robot_entries = [r for r in _robot_entries if r and r.get("enabled", True)]
+if not _robot_entries:
+    raise SystemExit(
+        "No enabled robots in sim_config.yaml (looked for `robots:` list "
+        "or legacy `robot:` dict)."
+    )
+ROBOTS = [
+    _resolve_robot_runtime(r, r.get("model", args.robot_model))
+    for r in _robot_entries
+]
+# Per-instance lidar layout override via CLI applies to ALL robots if set.
+if args.lidar_layout is not None:
+    for r in ROBOTS:
+        r["lidar_layout"] = args.lidar_layout
+# tf_targets override likewise.
+if args.tf_targets is not None:
+    for r in ROBOTS:
+        r["tf_targets"] = args.tf_targets
+
+# Pick which robot --debug-pose probes (default: first robot).
+_pose_robot_name = args.debug_pose_robot or ROBOTS[0]["robot_name"]
+_pose_robot = next((r for r in ROBOTS if r["robot_name"] == _pose_robot_name), None)
+if _pose_robot is None:
+    raise SystemExit(
+        f"--debug-pose-robot={_pose_robot_name!r} not found among "
+        f"{[r['robot_name'] for r in ROBOTS]}"
+    )
 
 # SimulationApp MUST be instantiated before importing any omni/pxr/isaacsim modules.
 from isaacsim import SimulationApp
@@ -200,8 +289,9 @@ import omni.timeline
 from isaacsim.core.utils.stage import open_stage, is_stage_loading
 
 print(f"[run_sim] Opening stage: {scene_path}")
-print(f"[run_sim] robot-model={args.robot_model}  robot={args.robot}  "
-      f"lidar-layout={args.lidar_layout}")
+print(f"[run_sim] robot-model={args.robot_model}  robots="
+      + ", ".join(f"{r['robot_name']}(ns={r['namespace']!r}, scale={r['scale']:.2f}, "
+                  f"lidar={r['lidar_layout']})" for r in ROBOTS))
 open_stage(str(scene_path))
 # Wait for the stage (and its references) to finish loading.
 while is_stage_loading():
@@ -223,56 +313,19 @@ if not args.no_ros2:
     if not args.no_clock:
         from syncai_omniverse.ros2.clock_publisher import attach_clock_publisher
 
+        # Single shared /clock for the whole stage (regardless of robot count).
         attach_clock_publisher(stage)
         print(f"[run_sim] Clock publisher attached: /clock (use rviz2/nav2 with use_sim_time:=true)")
 
+    # Imports lifted out of the per-robot loop so each is loaded once.
     from syncai_omniverse.ros2.tf_publisher import attach_tf_publisher
-
-    if args.tf_targets.strip().lower() == "auto":
-        target_links = None
-    else:
-        target_links = [s.strip() for s in args.tf_targets.split(",") if s.strip()]
-    attach_tf_publisher(
-        stage,
-        robot_path=args.robot,
-        target_links=target_links,
-        namespace=args.ros_namespace,
-    )
-    targets_desc = ",".join(target_links) if target_links else "<auto: all rigid-body links>"
-    ns_prefix = f"{args.ros_namespace}/" if args.ros_namespace else ""
-    print(f"[run_sim] TF publisher attached: {ns_prefix}base_link -> /tf  targets={targets_desc}")
-
     if not args.no_odom:
         from syncai_omniverse.ros2.odom_publisher import attach_odom_publisher
-
-        attach_odom_publisher(stage, robot_path=args.robot, namespace=args.ros_namespace)
-        ns_prefix = f"/{args.ros_namespace}" if args.ros_namespace else ""
-        print(f"[run_sim] Odom publisher attached: {ns_prefix}/odom, "
-              f"{ns_prefix}/joint_states, odom->base_link on /tf")
-
     if not args.no_cmdvel:
         from syncai_omniverse.ros2.cmd_vel_subscriber import (
             attach_cmd_vel_subscriber,
             print_cmd_vel_snapshot,
         )
-
-        attach_cmd_vel_subscriber(
-            stage,
-            robot_path=args.robot,
-            namespace=args.ros_namespace,
-            debug=args.debug_cmdvel,
-            topic=args.cmd_vel_topic,
-            wheel_distance=_model_cfg["wheel_distance"],
-            wheel_drive_damping=_model_cfg["wheel_drive_damping"],
-            wheel_drive_max_force=_model_cfg["wheel_drive_max_force"],
-            max_linear_accel=_model_cfg["max_linear_accel"],
-            max_linear_decel=_model_cfg["max_linear_decel"],
-            max_angular_accel=_model_cfg["max_angular_accel"],
-        )
-        ns_prefix = f"/{args.ros_namespace}" if args.ros_namespace else ""
-        print(f"[run_sim] cmd_vel subscriber attached: {ns_prefix}{args.cmd_vel_topic} -> "
-              f"drivewhl_l/r_joint")
-
     if not args.no_lidar:
         from isaacsim.core.utils.extensions import enable_extension as _enable_ext
 
@@ -285,67 +338,118 @@ if not args.no_ros2:
             attach_lidar_publisher,
         )
 
-        lidar_prims: list[str] = []
-        if args.lidar_layout == "dual_diagonal":
-            # Two RTX lidars on diagonal corners -> two separate /scan_* topics.
-            # nav2 side must merge them (laser_scan_multi_merger) or consume
-            # both in the obstacle layer.
-            # Dual-diagonal anti-ghost geometry: front sensor rotated 0°
-            # (open sector faces +X), rear rotated 180° (open sector faces -X).
-            # With 250° FOV each, the 110° blind wedge on each lidar covers
-            # the bearing to the opposite lidar, so they never cross-scan.
-            # Union coverage is still 360° because the two 250° sectors
-            # overlap 70° on each side.
-            lidar_prims.append(attach_lidar_publisher(
-                stage,
-                robot_path=args.robot,
-                lidar_link="lidar_link_front",
-                lidar_name="LidarFront",
-                topic="/scan_front",
-                frame_id="scan_front",
-                namespace=args.ros_namespace,
-                config=args.lidar_config,
-                publish_type=args.lidar_publish_type,
-                graph_path="/LidarActionGraphFront",
-                rotation_z_deg=0.0,
-                horizontal_fov_deg=250.0,
-            ))
-            lidar_prims.append(attach_lidar_publisher(
-                stage,
-                robot_path=args.robot,
-                lidar_link="lidar_link_rear",
-                lidar_name="LidarRear",
-                topic="/scan_rear",
-                frame_id="scan_rear",
-                namespace=args.ros_namespace,
-                config=args.lidar_config,
-                publish_type=args.lidar_publish_type,
-                graph_path="/LidarActionGraphRear",
-                rotation_z_deg=180.0,
-                horizontal_fov_deg=250.0,
-            ))
-            ns_prefix = f"/{args.ros_namespace}" if args.ros_namespace else ""
-            print(f"[run_sim] dual lidar attached: {ns_prefix}/scan_front + "
-                  f"{ns_prefix}/scan_rear  config={args.lidar_config}")
-        else:
-            lidar_prims.append(attach_lidar_publisher(
-                stage,
-                robot_path=args.robot,
-                lidar_link=args.lidar_parent,
-                frame_id=args.lidar_frame,
-                topic="/scan",
-                namespace=args.ros_namespace,
-                config=args.lidar_config,
-                publish_type=args.lidar_publish_type,
-            ))
-            ns_prefix = f"/{args.ros_namespace}" if args.ros_namespace else ""
-            print(f"[run_sim] lidar publisher attached: {ns_prefix}/scan  "
-                  f"config={args.lidar_config}  parent={args.lidar_parent}  "
-                  f"publish_type={args.lidar_publish_type}")
+    all_lidar_prims: list[str] = []
 
-        if args.lidar_debug_draw:
-            for prim_path in lidar_prims:
-                attach_lidar_debug_draw(prim_path)
+    for r in ROBOTS:
+        ns = r["namespace"]
+        rp = r["robot_path"]
+        gprefix = f"/{ns}" if ns else ""
+        ns_log = f"/{ns}" if ns else ""
+
+        # -- TF: per-robot graph + namespaced topics --
+        tf_targets_str = r["tf_targets"]
+        if tf_targets_str.strip().lower() == "auto":
+            target_links = None
+        else:
+            target_links = [s.strip() for s in tf_targets_str.split(",") if s.strip()]
+        attach_tf_publisher(
+            stage,
+            robot_path=rp,
+            target_links=target_links,
+            namespace=ns,
+            graph_path=_graph_path(ns, "TFActionGraph"),
+        )
+        targets_desc = ",".join(target_links) if target_links else "<auto: all rigid-body links>"
+        print(f"[run_sim] [{r['robot_name']}] TF: {ns_log}/tf, targets={targets_desc}")
+
+        # -- Odom + joint_states --
+        if not args.no_odom:
+            attach_odom_publisher(
+                stage, robot_path=rp, namespace=ns,
+                graph_path=_graph_path(ns, "OdomActionGraph"),
+            )
+            print(f"[run_sim] [{r['robot_name']}] Odom: {ns_log}/odom, "
+                  f"{ns_log}/joint_states")
+
+        # -- cmd_vel subscriber --
+        if not args.no_cmdvel:
+            attach_cmd_vel_subscriber(
+                stage,
+                robot_path=rp,
+                namespace=ns,
+                debug=args.debug_cmdvel,
+                topic=args.cmd_vel_topic,
+                wheel_radius=r["wheel_radius"],
+                wheel_distance=r["wheel_distance"],
+                wheel_drive_damping=r["wheel_drive_damping"],
+                wheel_drive_max_force=r["wheel_drive_max_force"],
+                max_linear_accel=r["max_linear_accel"],
+                max_linear_decel=r["max_linear_decel"],
+                max_angular_accel=r["max_angular_accel"],
+                graph_path=_graph_path(ns, "CmdVelActionGraph"),
+            )
+            print(f"[run_sim] [{r['robot_name']}] cmd_vel: {ns_log}{args.cmd_vel_topic} "
+                  f"(r={r['wheel_radius']:.3f}, d={r['wheel_distance']:.3f})")
+
+        # -- Lidar (per-robot, layout-dependent) --
+        if not args.no_lidar:
+            if r["lidar_layout"] == "dual_diagonal":
+                # Two RTX lidars on diagonal corners -> two namespaced /scan_*
+                # topics. Anti-ghost geometry: front 0°/250° + rear 180°/250°
+                # so each lidar's 110° blind wedge covers the bearing to the
+                # opposite one. Union coverage stays 360° (70° side overlap).
+                front = attach_lidar_publisher(
+                    stage,
+                    robot_path=rp,
+                    lidar_link="lidar_link_front",
+                    lidar_name="LidarFront",
+                    topic="/scan_front",
+                    frame_id="scan_front",
+                    namespace=ns,
+                    config=args.lidar_config,
+                    publish_type=args.lidar_publish_type,
+                    graph_path=_graph_path(ns, "LidarActionGraphFront"),
+                    rotation_z_deg=0.0,
+                    horizontal_fov_deg=250.0,
+                )
+                rear = attach_lidar_publisher(
+                    stage,
+                    robot_path=rp,
+                    lidar_link="lidar_link_rear",
+                    lidar_name="LidarRear",
+                    topic="/scan_rear",
+                    frame_id="scan_rear",
+                    namespace=ns,
+                    config=args.lidar_config,
+                    publish_type=args.lidar_publish_type,
+                    graph_path=_graph_path(ns, "LidarActionGraphRear"),
+                    rotation_z_deg=180.0,
+                    horizontal_fov_deg=250.0,
+                )
+                all_lidar_prims += [front, rear]
+                print(f"[run_sim] [{r['robot_name']}] dual lidar: "
+                      f"{ns_log}/scan_front + {ns_log}/scan_rear  "
+                      f"config={args.lidar_config}")
+            else:
+                p = attach_lidar_publisher(
+                    stage,
+                    robot_path=rp,
+                    lidar_link=args.lidar_parent,
+                    frame_id=args.lidar_frame,
+                    topic="/scan",
+                    namespace=ns,
+                    config=args.lidar_config,
+                    publish_type=args.lidar_publish_type,
+                    graph_path=_graph_path(ns, "LidarActionGraph"),
+                )
+                all_lidar_prims.append(p)
+                print(f"[run_sim] [{r['robot_name']}] single lidar: "
+                      f"{ns_log}/scan  config={args.lidar_config}  "
+                      f"parent={args.lidar_parent}")
+
+    if not args.no_lidar and args.lidar_debug_draw:
+        for prim_path in all_lidar_prims:
+            attach_lidar_debug_draw(prim_path)
 
     if not args.no_doors:
         from syncai_omniverse.ros2.door_controller import attach_door_controller
@@ -519,7 +623,7 @@ def _pose_probe_factory(robot_path: str):
     return _probe
 
 
-pose_probe = _pose_probe_factory(args.robot) if args.debug_pose else None
+pose_probe = _pose_probe_factory(_pose_robot["robot_path"]) if args.debug_pose else None
 
 try:
     import math as _math
@@ -544,7 +648,7 @@ try:
                 from pxr import Gf, Usd, UsdGeom
                 import omni.usd
                 _stage = omni.usd.get_context().get_stage()
-                _bl = _stage.GetPrimAtPath(f"{args.robot}/base_link")
+                _bl = _stage.GetPrimAtPath(f"{_pose_robot['robot_path']}/base_link")
                 if _bl and _bl.IsValid():
                     _xf = UsdGeom.Xformable(_bl).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
                     _m = Gf.Matrix3d(_xf.ExtractRotationMatrix())

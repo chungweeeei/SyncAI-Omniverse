@@ -5,6 +5,7 @@ from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdPhysics, UsdShade
 from syncai_omniverse.usd.stl_to_usd import build_warehouse
 from syncai_omniverse.usd.mir_amr import build_mir_amr
 from syncai_omniverse.usd.auto_door import build_auto_door
+from syncai_omniverse.usd.charging_station import build_charging_station
 
 
 # Registry of available robot model builders. `robot.model` in sim_config.yaml
@@ -24,6 +25,19 @@ def _build_robot(stage, robot_cfg: dict) -> str:
     return _BUILDERS[model](stage, robot_cfg)
 
 
+def _resolve_robots(config: dict) -> list:
+    """Return list of enabled robot configs.
+
+    Prefers plural `robots:` (list); falls back to legacy singular `robot:`
+    (dict) so existing single-robot configs keep working.
+    """
+    robots = config.get("robots")
+    if robots is None:
+        legacy = config.get("robot")
+        robots = [legacy] if legacy else []
+    return [r for r in robots if r and r.get("enabled", True)]
+
+
 def build_combined_scene(output_path: str, stl_path: str, config: dict) -> str:
     """
         Compose warehouse (from STL) and robot onto a single USD stage.
@@ -37,12 +51,14 @@ def build_combined_scene(output_path: str, stl_path: str, config: dict) -> str:
     stage = _new_stage(output_path)
     build_warehouse(stage, stl_path, config["stl"])
 
-    robot_cfg = config.get("robot", {}) or {}
-    if robot_cfg.get("enabled", True):
+    for robot_cfg in _resolve_robots(config):
         _build_robot(stage, robot_cfg)
 
     for door_cfg in config.get("doors") or []:
         build_auto_door(stage, door_cfg)
+
+    for station_cfg in config.get("charging_stations") or []:
+        build_charging_station(stage, station_cfg)
 
     stage.GetRootLayer().Save()
     return output_path
@@ -64,12 +80,14 @@ def build_robot_only_scene(output_path: str, config: dict) -> str:
     ground_size = (config.get("stl") or {}).get("ground_plane_size", [20.0, 20.0])
     _build_ground_plane(stage, ground_size)
 
-    robot_cfg = config.get("robot", {}) or {}
-    if robot_cfg.get("enabled", True):
+    for robot_cfg in _resolve_robots(config):
         _build_robot(stage, robot_cfg)
 
     for door_cfg in config.get("doors") or []:
         build_auto_door(stage, door_cfg)
+
+    for station_cfg in config.get("charging_stations") or []:
+        build_charging_station(stage, station_cfg)
 
     stage.GetRootLayer().Save()
     return output_path
