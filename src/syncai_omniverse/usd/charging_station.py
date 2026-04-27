@@ -1,4 +1,4 @@
-"""MiR250-style rear-docking charging station (static prop).
+"""MiR-style rear-docking charging station (static prop).
 
 Authored as a USD scene fragment that plugs into `scene.build_combined_scene`.
 Pure `pxr` / usd-core, no Isaac Sim dependency. The dock is world-anchored:
@@ -13,69 +13,69 @@ Local frame:
 Scene shape:
     /World/ChargingStations/<name>          Xform (pose carrier)
     ├── enclosure                           Xform
-    │   ├── body_{visual,collision}         Cube (visible / invisible+collider)
-    │   ├── top_cap_{visual,collision}      Cube (yellow accent)
-    │   └── base_skirt_visual               Cube (decorative, no collider)
+    │   └── body_{visual,collision}         Cube (white body)
     ├── faceplate                           Xform (translated +X to front)
-    │   ├── plate_{visual,collision}        Cube (dark grey faceplate)
-    │   ├── contact_left_visual             Cube (copper pad)
-    │   ├── contact_right_visual            Cube (copper pad)
-    │   └── led_strip_visual                Cube (emissive green)
-    └── approach_pad                        Xform (small floor docking plate)
-        ├── base_visual                     Cube (yellow plate)
-        ├── border_front_visual             Cube (thin black edge stripe)
-        ├── border_left_visual              Cube (thin black edge stripe)
-        └── border_right_visual             Cube (thin black edge stripe)
+    │   ├── plate_{visual,collision}        Cube (white faceplate slab)
+    │   └── window_visual                   Cube (dark recessed visual landmark)
+    └── approach_pad                        Xform (floor docking plate with electrodes)
+        ├── base_visual                     Cube (white plate)
+        ├── electrode_1_visual              Cube (copper contact strip, -Y cluster)
+        ├── electrode_2_visual              Cube (copper contact strip, -Y cluster)
+        └── electrode_3_visual              Cube (copper contact strip, -Y cluster)
 
-Geometry is hard-coded to the real MiR Charge 24V proportions
-(~0.58 W x 0.27 D x 0.35 H). YAML only exposes pose. The approach pad is
-a small (0.30 x 0.58 m) floor plate at the dock face -- mirroring the
-real MiR charging plate footprint, not a full landing zone. Decorative
-only (no collider) so the robot drives straight over it.
+Geometry is hard-coded to the real MiR Charge proportions (~0.58 W x 0.27 D
+x 0.30 H). YAML only exposes pose. The approach pad is a small (0.30 x 0.58 m)
+floor plate at the dock face -- mirroring the real MiR charging plate
+footprint. The 3 copper strips on the pad are the floor-side electrode
+contacts; the AMR drives over them and contacts from below. Decorative only
+(no collider) so the robot drives straight over it.
 """
 from pxr import Gf, Usd, UsdGeom
 
 from syncai_omniverse.usd._amr_common import (
     _add_box,
-    _define_emissive_material,
     _define_preview_material,
 )
 
 
-# MiR Charge 24V real-world reference dimensions (metres). Local axes:
+# MiR Charge real-world reference dimensions (metres). Local axes:
 # X = depth (faceplate normal direction), Y = width, Z = height.
 _BODY_DEPTH = 0.27
 _BODY_WIDTH = 0.58
 _BODY_HEIGHT = 0.30
-_TOP_CAP_HEIGHT = 0.05
-_SKIRT_OVERHANG = 0.03   # extra X/Y over the body
-_SKIRT_HEIGHT = 0.04
 
 _PLATE_THICKNESS = 0.01
-_PLATE_HEIGHT = 0.32
-_PLATE_WIDTH = _BODY_WIDTH - 0.03   # slight inset from body edges
+_PLATE_HEIGHT = _BODY_HEIGHT          # flush with body top/bottom
+_PLATE_WIDTH = _BODY_WIDTH - 0.02     # slight inset from body side edges
 _FACEPLATE_OFFSET_X = _BODY_DEPTH / 2.0 + _PLATE_THICKNESS / 2.0  # 0.140
 
-_CONTACT_PROUD = 0.005   # contacts/LED/AprilTag protrude this far past plate
-_CONTACT_SIZE = (0.005, 0.04, 0.06)
-_CONTACT_Y = 0.06         # ±Y offset of the two contact pads
-_CONTACT_Z = 0.18
+# Dark recessed window panel on the faceplate. Acts as a visual fiducial for
+# camera-based dock detection (the high-contrast dark rectangle on a white
+# body is what a vision pipeline can latch onto).
+_WINDOW_WIDTH = 0.34
+_WINDOW_HEIGHT = 0.14
+_WINDOW_THICKNESS = 0.005
+_WINDOW_PROUD = 0.003                 # sits this far in front of plate front
+_WINDOW_Z = 0.20                      # vertical centre on the faceplate
 
-_LED_SIZE = (0.005, 0.40, 0.012)
-_LED_Z = 0.305
+# Approach pad: small floor plate matching the real MiR charging-plate
+# footprint. Holds 3 copper electrode strips parallel to the docking
+# direction (X). The AMR reverses over the pad and contacts from below.
+_PAD_DEPTH = 0.30                     # X extent away from dock face
+_PAD_WIDTH = _BODY_WIDTH              # 0.58 m, matches dock body width
+_PAD_THICKNESS = 0.005                # 5 mm slab; sits just above the floor
+_PAD_GAP = 0.005                      # small air gap between dock and pad
 
-# Approach pad: small floor plate matching real MiR charging-plate footprint.
-# Sits flush with the dock skirt on the +X side and extends only ~0.3 m
-# forward -- not a full landing zone.
-_PAD_DEPTH = 0.30                # X extent away from dock face
-_PAD_WIDTH = _BODY_WIDTH         # 0.58 m, matches dock body width
-_PAD_THICKNESS = 0.005           # 5 mm slab; sits just above the floor
-_PAD_GAP = 0.005                 # small air gap between dock skirt and pad start
-_PAD_BORDER_W = 0.02             # 2 cm thin black border on three sides
+_ELECTRODE_LENGTH = 0.20              # X extent (along docking direction)
+_ELECTRODE_WIDTH = 0.04               # Y extent (strip width)
+_ELECTRODE_THICKNESS = 0.003          # 3 mm raised above pad top
+_ELECTRODE_GROUP_CENTER_Y = -0.15     # Y centre of the (right-clustered) group
+_ELECTRODE_PITCH = 0.08               # centre-to-centre spacing in Y
+_ELECTRODE_PROUD = 0.0005             # 0.5 mm above pad top to avoid z-fight
 
 
 def build_charging_station(stage: Usd.Stage, config: dict | None = None) -> str:
-    """Author one MiR250-style rear-docking charger onto `stage`.
+    """Author one MiR-style rear-docking charger onto `stage`.
 
     Config keys:
         name: prim name under /World/ChargingStations/ (default "Charger01").
@@ -85,9 +85,9 @@ def build_charging_station(stage: Usd.Stage, config: dict | None = None) -> str:
             (default [0, 0, 0]).
         rotation_z_deg: yaw of the dock (default 0.0). 0 = faceplate normal
             points +X; AMR reverses along -X to dock.
-        approach_pad: bool (default True). When True, author a small
-            yellow/black floor docking plate on the +X side. No collider --
-            the robot drives straight over it.
+        approach_pad: bool (default True). When True, author the white
+            floor plate with 3 copper electrode strips. No collider -- the
+            robot drives straight over it.
 
     Returns the charger root prim path.
     """
@@ -111,8 +111,8 @@ def build_charging_station(stage: Usd.Stage, config: dict | None = None) -> str:
 
     charger_path = f"{root_path}/{name}"
 
-    # -- Charger root: Xform with TranslateOp BEFORE RotateZOp so yaw spins
-    # around the dock base centre, not around the world origin (memory rule).
+    # -- Charger root: TranslateOp BEFORE RotateZOp so yaw spins around the
+    # dock base centre, not around the world origin (memory rule).
     charger_xform = UsdGeom.Xform.Define(stage, charger_path)
     charger_xform.AddTranslateOp().Set(Gf.Vec3d(*position))
     if rotation_z_deg != 0.0:
@@ -120,7 +120,7 @@ def build_charging_station(stage: Usd.Stage, config: dict | None = None) -> str:
 
     charger_prim = charger_xform.GetPrim()
     charger_prim.SetCustomDataByKey("charger_id", charger_id)
-    charger_prim.SetCustomDataByKey("version", "v1")
+    charger_prim.SetCustomDataByKey("version", "v2")
     # Future docking-pose queries can read these without re-parsing YAML.
     charger_prim.SetCustomDataByKey("faceplate_offset_x", float(_FACEPLATE_OFFSET_X))
     charger_prim.SetCustomDataByKey("body_depth", float(_BODY_DEPTH))
@@ -129,21 +129,13 @@ def build_charging_station(stage: Usd.Stage, config: dict | None = None) -> str:
 
     # -- Materials (idempotent on /World/Materials, shared across chargers).
     body_mat = _define_preview_material(
-        stage, "/World/Materials/ChargerBodyMat", Gf.Vec3f(0.20, 0.20, 0.22)
+        stage, "/World/Materials/ChargerBodyMat", Gf.Vec3f(0.92, 0.92, 0.92)
     )
-    accent_mat = _define_preview_material(
-        stage, "/World/Materials/ChargerAccentMat", Gf.Vec3f(0.95, 0.78, 0.10)
+    window_mat = _define_preview_material(
+        stage, "/World/Materials/ChargerWindowMat", Gf.Vec3f(0.08, 0.08, 0.10)
     )
-    copper_mat = _define_preview_material(
-        stage, "/World/Materials/ChargerCopperMat", Gf.Vec3f(0.72, 0.45, 0.20)
-    )
-    led_mat = _define_emissive_material(
-        stage, "/World/Materials/ChargerLedMat",
-        emissive_color=Gf.Vec3f(0.10, 1.0, 0.20),
-        base_color=Gf.Vec3f(0.05, 0.20, 0.05),
-    )
-    pad_black_mat = _define_preview_material(
-        stage, "/World/Materials/ChargerPadBlackMat", Gf.Vec3f(0.05, 0.05, 0.05)
+    electrode_mat = _define_preview_material(
+        stage, "/World/Materials/ChargerElectrodeMat", Gf.Vec3f(0.78, 0.50, 0.25)
     )
 
     # -- Enclosure subassembly --
@@ -165,29 +157,12 @@ def build_charging_station(stage: Usd.Stage, config: dict | None = None) -> str:
         _add_box(stage, f"{path}/visual", size=size,
                  material=vis_material, collision=False)
 
-    # Body: main dark-grey enclosure. Centre at z = body_height/2.
+    # Body: single white enclosure cube. Centre at z = body_height/2.
     _static_pair(
         f"{charger_path}/enclosure/body",
         translate=(0.0, 0.0, _BODY_HEIGHT / 2.0),
         size=(_BODY_DEPTH, _BODY_WIDTH, _BODY_HEIGHT),
         vis_material=body_mat,
-    )
-    # Top cap: yellow accent slab on top of body.
-    _static_pair(
-        f"{charger_path}/enclosure/top_cap",
-        translate=(0.0, 0.0, _BODY_HEIGHT + _TOP_CAP_HEIGHT / 2.0),
-        size=(_BODY_DEPTH, _BODY_WIDTH, _TOP_CAP_HEIGHT),
-        vis_material=accent_mat,
-    )
-    # Base skirt: yellow flange at floor (decorative; body collider already
-    # handles floor contact).
-    _decorative(
-        f"{charger_path}/enclosure/base_skirt",
-        translate=(0.0, 0.0, _SKIRT_HEIGHT / 2.0),
-        size=(_BODY_DEPTH + 2 * _SKIRT_OVERHANG,
-              _BODY_WIDTH + 2 * _SKIRT_OVERHANG,
-              _SKIRT_HEIGHT),
-        vis_material=accent_mat,
     )
 
     # -- Faceplate subassembly: translated to sit flush on body's +X face.
@@ -195,8 +170,7 @@ def build_charging_station(stage: Usd.Stage, config: dict | None = None) -> str:
     faceplate = UsdGeom.Xform.Define(stage, faceplate_path)
     faceplate.AddTranslateOp().Set(Gf.Vec3d(_FACEPLATE_OFFSET_X, 0.0, 0.0))
 
-    # Faceplate slab: visual + collider so the AMR rear bumps it. Wrapped in
-    # a translated Xform so the slab base sits at faceplate-local z=0.
+    # Faceplate slab: visual + collider so the AMR rear bumps it.
     _static_pair(
         f"{faceplate_path}/plate",
         translate=(0.0, 0.0, _PLATE_HEIGHT / 2.0),
@@ -204,73 +178,46 @@ def build_charging_station(stage: Usd.Stage, config: dict | None = None) -> str:
         vis_material=body_mat,
     )
 
-    # Two copper contact pads, raised slightly proud (+X) of the plate.
+    # Dark window panel = high-contrast visual landmark for vision-based
+    # dock detection. Sits proud of the faceplate so it reads cleanly from
+    # any approach angle.
     _decorative(
-        f"{faceplate_path}/contact_left",
-        translate=(_CONTACT_PROUD, +_CONTACT_Y, _CONTACT_Z),
-        size=_CONTACT_SIZE,
-        vis_material=copper_mat,
-    )
-    _decorative(
-        f"{faceplate_path}/contact_right",
-        translate=(_CONTACT_PROUD, -_CONTACT_Y, _CONTACT_Z),
-        size=_CONTACT_SIZE,
-        vis_material=copper_mat,
-    )
-    # Emissive LED status strip across the top of the faceplate.
-    _decorative(
-        f"{faceplate_path}/led_strip",
-        translate=(_CONTACT_PROUD, 0.0, _LED_Z),
-        size=_LED_SIZE,
-        vis_material=led_mat,
+        f"{faceplate_path}/window",
+        translate=(_WINDOW_PROUD, 0.0, _WINDOW_Z),
+        size=(_WINDOW_THICKNESS, _WINDOW_WIDTH, _WINDOW_HEIGHT),
+        vis_material=window_mat,
     )
 
-    # -- Approach pad: small yellow plate on +X side, matching the real MiR
-    # charging-plate footprint (~0.30 x 0.58 m). Black border on the three
-    # outer edges (front + sides; the dock-side edge merges into the skirt).
-    # Border strips z-stack 0.5 mm above the base to avoid z-fighting.
+    # -- Approach pad: white floor plate with 3 copper electrode strips
+    # running along the docking direction (X). The AMR reverses over the
+    # pad and contacts from below. No collider so the robot drives over.
     if enable_approach_pad:
-        skirt_outer_x = _BODY_DEPTH / 2.0 + _SKIRT_OVERHANG
-        pad_x_start = skirt_outer_x + _PAD_GAP
+        body_outer_x = _BODY_DEPTH / 2.0
+        pad_x_start = body_outer_x + _PAD_GAP
         pad_x_center = pad_x_start + _PAD_DEPTH / 2.0
         pad_z_center = _PAD_THICKNESS / 2.0
-        border_z_center = _PAD_THICKNESS + 0.0005   # 0.5 mm above base top
-        border_thickness = 0.001                     # 1 mm thin strip
+        electrode_z = _PAD_THICKNESS + _ELECTRODE_THICKNESS / 2.0 + _ELECTRODE_PROUD
 
         pad_root = f"{charger_path}/approach_pad"
         UsdGeom.Xform.Define(stage, pad_root)
 
-        # Yellow base.
+        # White base plate.
         _decorative(
             f"{pad_root}/base",
             translate=(pad_x_center, 0.0, pad_z_center),
             size=(_PAD_DEPTH, _PAD_WIDTH, _PAD_THICKNESS),
-            vis_material=accent_mat,
+            vis_material=body_mat,
         )
-        # Front border (far edge from dock, runs along Y).
-        front_x = pad_x_start + _PAD_DEPTH - _PAD_BORDER_W / 2.0
-        _decorative(
-            f"{pad_root}/border_front",
-            translate=(front_x, 0.0, border_z_center),
-            size=(_PAD_BORDER_W, _PAD_WIDTH, border_thickness),
-            vis_material=pad_black_mat,
-        )
-        # Side borders (run along X). Inset by half the front-border width
-        # so the three borders meet cleanly at the front corners.
-        side_x_center = pad_x_center - _PAD_BORDER_W / 2.0
-        side_x_extent = _PAD_DEPTH - _PAD_BORDER_W
-        side_y = (_PAD_WIDTH - _PAD_BORDER_W) / 2.0
-        _decorative(
-            f"{pad_root}/border_left",
-            translate=(side_x_center, +side_y, border_z_center),
-            size=(side_x_extent, _PAD_BORDER_W, border_thickness),
-            vis_material=pad_black_mat,
-        )
-        _decorative(
-            f"{pad_root}/border_right",
-            translate=(side_x_center, -side_y, border_z_center),
-            size=(side_x_extent, _PAD_BORDER_W, border_thickness),
-            vis_material=pad_black_mat,
-        )
+
+        # 3 copper electrode strips, parallel along X, clustered on the -Y
+        # (right) half of the pad. Centre-to-centre spacing = _ELECTRODE_PITCH.
+        for idx, k in enumerate((-1, 0, +1), start=1):
+            y_off = _ELECTRODE_GROUP_CENTER_Y + k * _ELECTRODE_PITCH
+            _decorative(
+                f"{pad_root}/electrode_{idx}",
+                translate=(pad_x_center, y_off, electrode_z),
+                size=(_ELECTRODE_LENGTH, _ELECTRODE_WIDTH, _ELECTRODE_THICKNESS),
+                vis_material=electrode_mat,
+            )
 
     return charger_path
