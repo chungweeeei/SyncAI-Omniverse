@@ -73,5 +73,60 @@ charging_stations:
     rotation_z_deg: -90.0            # -90 deg yaw (-1.57 rad); faceplate normal points -Y
     # approach_pad: true             # default; set false to omit the floor plate
 
+conveyors:
+  # Isaac Sim 5.1 ConveyorBelt assets, referenced from a local copy of
+  # NVIDIA's public asset bucket (download with `tools/fetch_isaac_conveyor.py`).
+  # Each entry becomes /World/Conveyors/<id> with the asset's defaultPrim
+  # subtree composed in via reference. Geometry, materials and colliders
+  # come from the Isaac USD; we only own placement + customData.
+  #
+  # Per-entry keys (see src/syncai_omniverse/usd/conveyor.py for full doc):
+  #   id (required)        : prim name + ROS2 topic key
+  #   usd_path (required)  : repo-root-relative path to the conveyor USD
+  #   position             : [x, y, z] world XYZ; conveyor's local origin
+  #                          (Isaac authors the bottom near z=0 -- a small z>0
+  #                          lift avoids z-fighting with the warehouse ground).
+  #   rotation_z_deg       : yaw in degrees (0 = belt aligned with world +X)
+  #   scale                : uniform scale factor (default 1.0)
+  #   belt_surface_prim    : (optional) belt mesh prim under the wrapper to
+  #                          target with surface velocity at runtime; default
+  #                          "<wrapper>/Belt" is a placeholder -- override
+  #                          per-variant when wiring belt motion later.
+  #   ros2_speed_topic / ros2_status_topic : optional topic overrides
+  - name: "Conveyor01"
+    id: "conveyor_01"
+    usd_path: "assets/usd/conveyors/ConveyorBelt_A08.usd"
+    # East-wall loading station: belt runs north-south along world Y.
+    # A08 is 2.72 m long x 1.15 m wide; with rot=90 the belt occupies
+    # world X=[5.93, 7.08], Y=[-5.72, -3.00] -- ~1.2 m from the +X wall,
+    # ~8 m from EastDoor, clear of both robots' spawn area.
+    position: [-2.0, 10.0, 0.05]
+    rotation_z_deg: 90.0
+    scale: 1.0
+    # ConveyorBelt_A08's belt mesh is SM_ConveyorBelt_A08_02 (the prim name
+    # varies per Isaac variant). Pinned here so the runtime IsaacConveyor
+    # node knows which surface to drive when belt motion is wired up.
+    belt_surface_prim: "/World/Conveyors/conveyor_01/SM_ConveyorBelt_A08_02"
+
+    # Cargo box spawned at runtime by run_sim.py (DynamicCuboid). With the
+    # conveyor at position [-2, 10] rotated 90 deg, the belt occupies world
+    # X=[-2.58, -1.42], Y=[7.28, 10.00], Z=[0.05, 1.22]. Spawn just past the
+    # head end (Y=7.28) and ~0.2 m above the belt top.
+    test_box:
+      enabled: true
+      size: 0.3
+      mass: 5.0
+      position: [-2.0, 7.5, 1.45]
+
+    # Limit switch implemented as a soft gate inside the runtime ScriptNode:
+    # while box.world_pos[axis] >= threshold, effective conveyor speed is
+    # pinned to 0 and the status topic publishes "limit_triggered". When the
+    # box moves back below the threshold the commanded speed resumes.
+    # Threshold below = 0.3 m short of the tail (Y_max=10.0).
+    limit_switch:
+      enabled: true
+      axis: "y"
+      threshold: 9.7
+
 output:
   scene_path: "scenes/dp1f_mir.usda"

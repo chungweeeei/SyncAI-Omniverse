@@ -169,6 +169,11 @@ parser.add_argument(
     help="Skip attaching ROS2 controllers for /World/Doors/* articulations.",
 )
 parser.add_argument(
+    "--no-conveyors",
+    action="store_true",
+    help="Skip attaching ROS2 controllers + cargo box for /World/Conveyors/*.",
+)
+parser.add_argument(
     "--lidar-debug-draw",
     action="store_true",
     help="Draw each RTX lidar's returns in the viewport as red points "
@@ -484,6 +489,105 @@ if not args.no_ros2:
                     open_target=open_target,
                     namespace="",
                     graph_path=f"/DoorGraph_{name}",
+                )
+
+    if not args.no_conveyors:
+        # IsaacConveyor lives in isaacsim.asset.gen.conveyor; enable it BEFORE
+        # creating the OG nodes that reference its node type. Same 20-tick
+        # update wait as the ROS2 bridge / RTX sensor enables above.
+        from isaacsim.core.utils.extensions import enable_extension as _enable_ext
+        _enable_ext("isaacsim.asset.gen.conveyor")
+        for _ in range(20):
+            simulation_app.update()
+
+        from syncai_omniverse.ros2.conveyor_controller import (
+            attach_conveyor_controller,
+        )
+
+        # Walk /World/Conveyors and attach one IsaacConveyor + ScriptNode +
+        # ROS2Subscriber graph per conveyor. CustomData (authored by
+        # syncai_omniverse.usd.conveyor.build_conveyor) carries the speed/
+        # status topics, belt surface prim, optional cargo box config, and
+        # optional limit-switch threshold -- the scene stays self-describing.
+        conv_root = stage.GetPrimAtPath("/World/Conveyors")
+        if conv_root and conv_root.IsValid():
+            for conv in conv_root.GetChildren():
+                cd = conv.GetCustomData() or {}
+                speed_topic = cd.get("ros2_speed_topic")
+                status_topic = cd.get("ros2_status_topic")
+                belt_prim = cd.get("belt_surface_prim")
+                if not (speed_topic and status_topic and belt_prim):
+                    continue
+                # Direction stored as Gf.Vec3f; cast to plain tuple for the
+                # controller signature.
+                dir_v = cd.get("direction")
+                if dir_v is None:
+                    direction = (1.0, 0.0, 0.0)
+                else:
+                    direction = (float(dir_v[0]), float(dir_v[1]), float(dir_v[2]))
+
+                # Optional cargo box -- spawn a DynamicCuboid at the
+                # configured world position. We do this BEFORE the controller
+                # attach so the controller can pass the box prim path into
+                # the ScriptNode for the limit-switch read.
+                box_prim_path = None
+                if cd.get("test_box_enabled"):
+                    bp = cd.get("test_box_position")
+                    if bp is None:
+                        print(f"[run_sim] [conveyor {conv.GetName()}] "
+                              f"test_box_enabled but test_box_position missing; "
+                              f"skipping box spawn")
+                    else:
+                        try:
+                            from isaacsim.core.api.objects import DynamicCuboid
+                            import numpy as np
+                            box_prim_path = (
+                                f"/World/CargoBoxes/box_{conv.GetName()}"
+                            )
+                            DynamicCuboid(
+                                prim_path=box_prim_path,
+                                position=np.array(
+                                    [float(bp[0]), float(bp[1]), float(bp[2])]
+                                ),
+                                size=float(cd.get("test_box_size", 0.3)),
+                                mass=float(cd.get("test_box_mass", 5.0)),
+                                color=np.array([0.85, 0.55, 0.10]),
+                            )
+                            print(f"[run_sim] [conveyor {conv.GetName()}] "
+                                  f"spawned cargo box at {box_prim_path}  "
+                                  f"pos=({float(bp[0]):.2f},"
+                                  f"{float(bp[1]):.2f},{float(bp[2]):.2f})")
+                        except Exception as exc:
+                            print(f"[run_sim] [conveyor {conv.GetName()}] "
+                                  f"DynamicCuboid spawn failed: {exc}")
+                            box_prim_path = None
+
+                limit_axis = (
+                    cd.get("limit_switch_axis")
+                    if cd.get("limit_switch_enabled")
+                    else None
+                )
+                limit_thr = (
+                    float(cd.get("limit_switch_threshold", 0.0))
+                    if limit_axis
+                    else None
+                )
+
+                # Conveyors, like doors, are shared infrastructure; keep the
+                # ROS2 namespace empty so any robot in the scene can drive the
+                # same /conveyor/<id>/speed_cmd topic.
+                attach_conveyor_controller(
+                    stage,
+                    conveyor_path=str(conv.GetPath()),
+                    speed_topic=speed_topic,
+                    status_topic=status_topic,
+                    belt_surface_prim=belt_prim,
+                    direction=direction,
+                    box_prim=box_prim_path,
+                    limit_axis=limit_axis,
+                    limit_threshold=limit_thr,
+                    namespace="",
+                    graph_path=f"/ConveyorGraph_{conv.GetName()}",
                 )
 
 omni.timeline.get_timeline_interface().play()
