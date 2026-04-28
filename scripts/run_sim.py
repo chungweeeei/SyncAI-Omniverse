@@ -588,6 +588,7 @@ if not args.no_ros2:
                     limit_threshold=limit_thr,
                     namespace="",
                     graph_path=f"/ConveyorGraph_{conv.GetName()}",
+                    debug=True,
                 )
 
 omni.timeline.get_timeline_interface().play()

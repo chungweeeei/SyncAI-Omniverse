@@ -64,7 +64,7 @@ from syncai_omniverse.ros2._ns import apply_namespace as _apply_namespace
 _DOOR_SCRIPT = """\
 import time as _time
 
-_state = {
+_door_state = {
     "sub_attr": None,
     "ros_node": None,
     "ros_pub": None,
@@ -80,28 +80,28 @@ _state = {
     "leaf_z": 0.0,
     "left_cur_y": 0.0,
     "right_cur_y": 0.0,
-    "last_state": None,
+    "last_door_state": None,
     "last_pub_time": 0.0,
 }
 
 # Max slide speed (m / physics-tick). At 60 Hz physics, 0.03 m/tick =
 # 1.8 m/s, so a 1.45 m opening completes in ~0.8 s.
-_STEP = 0.03
-# "At target" tolerance for the state machine. Must be < _STEP so a leaf
+_DOOR_STEP = 0.03
+# "At target" tolerance for the state machine. Must be < _DOOR_STEP so a leaf
 # can't simultaneously satisfy "still stepping" and "at target".
-_AT_TARGET_EPS = 1e-4
+_DOOR_AT_TARGET_EPS = 1e-4
 # Heartbeat period for /state publishing while the string is unchanged.
 # State transitions bypass this and publish immediately.
-_HEARTBEAT_PERIOD_S = 1.0
+_DOOR_HEARTBEAT_PERIOD_S = 1.0
 
 
 def setup(db):
     import omni.graph.core as og
     import omni.usd
     try:
-        _state["sub_attr"] = og.Controller.attribute(str(db.inputs.subAttrPath))
+        _door_state["sub_attr"] = og.Controller.attribute(str(db.inputs.subAttrPath))
     except Exception:
-        _state["sub_attr"] = None
+        _door_state["sub_attr"] = None
 
     # Direct rclpy publisher for /state. The isaacsim.ros2.bridge
     # extension has already initialised rclpy by the time this graph
@@ -115,49 +115,49 @@ def setup(db):
             rclpy.init()
         node_name = str(db.inputs.rosNodeName)
         state_topic = str(db.inputs.stateTopic)
-        _state["ros_node"] = rclpy.create_node(node_name)
-        _state["ros_pub"] = _state["ros_node"].create_publisher(
+        _door_state["ros_node"] = rclpy.create_node(node_name)
+        _door_state["ros_pub"] = _door_state["ros_node"].create_publisher(
             String, state_topic, 10
         )
-        _state["ros_msg"] = String()
+        _door_state["ros_msg"] = String()
     except Exception as exc:
         print(f"[door] rclpy publisher setup failed: {exc}")
-        _state["ros_node"] = None
-        _state["ros_pub"] = None
-        _state["ros_msg"] = None
+        _door_state["ros_node"] = None
+        _door_state["ros_pub"] = None
+        _door_state["ros_msg"] = None
 
     stage = omni.usd.get_context().get_stage()
     left_path = str(db.inputs.leftPrimPath)
     right_path = str(db.inputs.rightPrimPath)
-    _state["left_prim"] = stage.GetPrimAtPath(left_path)
-    _state["right_prim"] = stage.GetPrimAtPath(right_path)
+    _door_state["left_prim"] = stage.GetPrimAtPath(left_path)
+    _door_state["right_prim"] = stage.GetPrimAtPath(right_path)
     # Pull per-leaf slide bounds from customData authored by auto_door.py.
-    lcd = _state["left_prim"].GetCustomData() or {}
-    rcd = _state["right_prim"].GetCustomData() or {}
-    _state["left_closed_y"] = float(lcd.get("closed_y", 0.0))
-    _state["left_open_y"] = float(lcd.get("open_y", 0.0))
-    _state["right_closed_y"] = float(rcd.get("closed_y", 0.0))
-    _state["right_open_y"] = float(rcd.get("open_y", 0.0))
-    _state["leaf_z"] = float(lcd.get("leaf_z", 0.0))
-    _state["left_cur_y"] = _state["left_closed_y"]
-    _state["right_cur_y"] = _state["right_closed_y"]
+    lcd = _door_state["left_prim"].GetCustomData() or {}
+    rcd = _door_state["right_prim"].GetCustomData() or {}
+    _door_state["left_closed_y"] = float(lcd.get("closed_y", 0.0))
+    _door_state["left_open_y"] = float(lcd.get("open_y", 0.0))
+    _door_state["right_closed_y"] = float(rcd.get("closed_y", 0.0))
+    _door_state["right_open_y"] = float(rcd.get("open_y", 0.0))
+    _door_state["leaf_z"] = float(lcd.get("leaf_z", 0.0))
+    _door_state["left_cur_y"] = _door_state["left_closed_y"]
+    _door_state["right_cur_y"] = _door_state["right_closed_y"]
     # Resolve each leaf's existing translate op once so we can rewrite it
     # fast each tick (avoids scanning xformOpOrder per compute).
     from pxr import UsdGeom
-    for prim, key in [(_state["left_prim"], "left_xform_op"),
-                      (_state["right_prim"], "right_xform_op")]:
+    for prim, key in [(_door_state["left_prim"], "left_xform_op"),
+                      (_door_state["right_prim"], "right_xform_op")]:
         xf = UsdGeom.Xformable(prim)
         for op in xf.GetOrderedXformOps():
             if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
-                _state[key] = op
+                _door_state[key] = op
                 break
-        if _state[key] is None:
+        if _door_state[key] is None:
             # auto_door.py always adds a translate op, but fall back to
             # creating one if some other authoring tool stripped it.
-            _state[key] = xf.AddTranslateOp()
+            _door_state[key] = xf.AddTranslateOp()
 
 
-def _step_toward(cur, target, step):
+def _door_step_toward(cur, target, step):
     if cur < target:
         return min(cur + step, target)
     if cur > target:
@@ -168,11 +168,11 @@ def _step_toward(cur, target, step):
 def compute(db):
     import omni.graph.core as og
     from pxr import Gf
-    sub = _state["sub_attr"]
+    sub = _door_state["sub_attr"]
     if sub is None:
         try:
-            _state["sub_attr"] = og.Controller.attribute(str(db.inputs.subAttrPath))
-            sub = _state["sub_attr"]
+            _door_state["sub_attr"] = og.Controller.attribute(str(db.inputs.subAttrPath))
+            sub = _door_state["sub_attr"]
         except Exception:
             sub = None
     is_open = False
@@ -182,43 +182,43 @@ def compute(db):
         except Exception:
             is_open = False
 
-    left_target = _state["left_open_y"] if is_open else _state["left_closed_y"]
-    right_target = _state["right_open_y"] if is_open else _state["right_closed_y"]
-    _state["left_cur_y"] = _step_toward(_state["left_cur_y"], left_target, _STEP)
-    _state["right_cur_y"] = _step_toward(_state["right_cur_y"], right_target, _STEP)
+    left_target = _door_state["left_open_y"] if is_open else _door_state["left_closed_y"]
+    right_target = _door_state["right_open_y"] if is_open else _door_state["right_closed_y"]
+    _door_state["left_cur_y"] = _door_step_toward(_door_state["left_cur_y"], left_target, _DOOR_STEP)
+    _door_state["right_cur_y"] = _door_step_toward(_door_state["right_cur_y"], right_target, _DOOR_STEP)
 
-    z = _state["leaf_z"]
-    if _state["left_xform_op"]:
-        _state["left_xform_op"].Set(Gf.Vec3d(0.0, _state["left_cur_y"], z))
-    if _state["right_xform_op"]:
-        _state["right_xform_op"].Set(Gf.Vec3d(0.0, _state["right_cur_y"], z))
+    z = _door_state["leaf_z"]
+    if _door_state["left_xform_op"]:
+        _door_state["left_xform_op"].Set(Gf.Vec3d(0.0, _door_state["left_cur_y"], z))
+    if _door_state["right_xform_op"]:
+        _door_state["right_xform_op"].Set(Gf.Vec3d(0.0, _door_state["right_cur_y"], z))
 
     at_closed = (
-        abs(_state["left_cur_y"] - _state["left_closed_y"]) < _AT_TARGET_EPS
-        and abs(_state["right_cur_y"] - _state["right_closed_y"]) < _AT_TARGET_EPS
+        abs(_door_state["left_cur_y"] - _door_state["left_closed_y"]) < _DOOR_AT_TARGET_EPS
+        and abs(_door_state["right_cur_y"] - _door_state["right_closed_y"]) < _DOOR_AT_TARGET_EPS
     )
     at_open = (
-        abs(_state["left_cur_y"] - _state["left_open_y"]) < _AT_TARGET_EPS
-        and abs(_state["right_cur_y"] - _state["right_open_y"]) < _AT_TARGET_EPS
+        abs(_door_state["left_cur_y"] - _door_state["left_open_y"]) < _DOOR_AT_TARGET_EPS
+        and abs(_door_state["right_cur_y"] - _door_state["right_open_y"]) < _DOOR_AT_TARGET_EPS
     )
     if is_open:
         state_str = "open" if at_open else "opening"
     else:
         state_str = "closed" if at_closed else "closing"
 
-    pub = _state["ros_pub"]
-    msg = _state["ros_msg"]
+    pub = _door_state["ros_pub"]
+    msg = _door_state["ros_msg"]
     now = _time.time()
     should_publish = (
-        state_str != _state["last_state"]
-        or (now - _state["last_pub_time"]) >= _HEARTBEAT_PERIOD_S
+        state_str != _door_state["last_door_state"]
+        or (now - _door_state["last_pub_time"]) >= _DOOR_HEARTBEAT_PERIOD_S
     )
     if should_publish and pub is not None and msg is not None:
         msg.data = state_str
         try:
             pub.publish(msg)
-            _state["last_state"] = state_str
-            _state["last_pub_time"] = now
+            _door_state["last_door_state"] = state_str
+            _door_state["last_pub_time"] = now
         except Exception as exc:
             print(f"[door] publish failed: {exc}")
     return True
@@ -254,7 +254,7 @@ def attach_door_controller(
     sub_attr_path = f"{graph_path}/SubBool.outputs:data"
     # Per-door rclpy node name -- must be unique across doors so multiple
     # DoorGraph_* in the same process don't collide on the same Node.
-    ros_node_name = f"door_{door_prim.GetName()}_state_pub".replace("/", "_")
+    ros_node_name = f"door_{door_prim.GetName()}_door_state_pub".replace("/", "_")
 
     create_nodes = [
         ("OnPhysics", "isaacsim.core.nodes.OnPhysicsStep"),
