@@ -230,7 +230,6 @@ def attach_door_controller(
     door_path: str,
     cmd_topic: str,
     state_topic: str,
-    open_target: float = 0.95,
     namespace: str = "",
     graph_path: str | None = None,
     debug: bool = False,
@@ -299,8 +298,7 @@ def attach_door_controller(
         },
     )
 
-    print(f"[door] graph={graph_path}  cmd={cmd_topic}  state={state_topic}  "
-          f"open_target={open_target}")
+    print(f"[door] graph={graph_path}  cmd={cmd_topic}  state={state_topic}")
     print(f"[door]   leaves: {left_path}, {right_path}")
 
     if debug:

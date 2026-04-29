@@ -106,17 +106,9 @@ def _graph_path(namespace: str, suffix: str) -> str:
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument(
-    "--robot-model",
-    default="mir250",
-    choices=sorted(_MODEL_DEFAULTS),
-    help="AMR model the scene was built from. Drives drive gains, accel "
-         "limits, default lidar layout, and unscaled wheel geometry. "
-         "Per-robot scale / namespace still come from sim_config.yaml.",
-)
-parser.add_argument(
     "--scene",
     default=None,
-    help="Path to the USD stage to open. Defaults per --robot-model.",
+    help="Path to the USD stage to open. Defaults to the mir250 scene.",
 )
 parser.add_argument("--headless", action="store_true", help="Run without a window.")
 parser.add_argument("--no-ros2", action="store_true", help="Skip ROS2 TF publisher setup.")
@@ -125,8 +117,8 @@ parser.add_argument(
     default=None,
     help="Comma-separated link names under --robot to publish (relative to --robot). "
          "Each entry may use `prim:frame_id` to decouple the USD prim from the "
-         "published TF frame id. Default per --robot-model (mir250: "
-         "`lidar_link_front:scan_front,lidar_link_rear:scan_rear`). Use 'auto' "
+         "published TF frame id. Defaults to mir250's "
+         "`lidar_link_front:scan_front,lidar_link_rear:scan_rear`. Use 'auto' "
          "for every rigid-body child link (prim name == frame id).",
 )
 parser.add_argument(
@@ -204,7 +196,7 @@ parser.add_argument(
          "point, publishing to --cmd-vel-topic-style single /scan. "
          "dual_diagonal: two RTX lidars at front-left + rear-right, publishing "
          "/scan_front + /scan_rear on separate graphs (matches real MiR250 "
-         "safety-lidar layout). Defaults per --robot-model.",
+         "safety-lidar layout). Defaults to dual_diagonal.",
 )
 parser.add_argument(
     "--lidar-parent",
@@ -238,7 +230,8 @@ parser.add_argument(
 args = parser.parse_args()
 
 # Resolve scene path + load YAML to discover the per-robot list.
-_model_cfg = _MODEL_DEFAULTS[args.robot_model]
+_DEFAULT_MODEL = "mir250"
+_model_cfg = _MODEL_DEFAULTS[_DEFAULT_MODEL]
 if args.scene is None:
     args.scene = _model_cfg["scene"]
 if args.lidar_parent is None:
@@ -260,7 +253,7 @@ if not _robot_entries:
         "or legacy `robot:` dict)."
     )
 ROBOTS = [
-    _resolve_robot_runtime(r, r.get("model", args.robot_model))
+    _resolve_robot_runtime(r, r.get("model", _DEFAULT_MODEL))
     for r in _robot_entries
 ]
 # Per-instance lidar layout override via CLI applies to ALL robots if set.
@@ -294,7 +287,7 @@ import omni.timeline
 from isaacsim.core.utils.stage import open_stage, is_stage_loading
 
 print(f"[run_sim] Opening stage: {scene_path}")
-print(f"[run_sim] robot-model={args.robot_model}  robots="
+print(f"[run_sim] robots="
       + ", ".join(f"{r['robot_name']}(ns={r['namespace']!r}, scale={r['scale']:.2f}, "
                   f"lidar={r['lidar_layout']})" for r in ROBOTS))
 open_stage(str(scene_path))
@@ -475,7 +468,6 @@ if not args.no_ros2:
                 state_topic = custom.get("ros2_state_topic")
                 if cmd_topic is None or state_topic is None:
                     continue
-                open_target = float(custom.get("open_target", 0.95))
                 # Doors are shared warehouse infrastructure, not robot-specific.
                 # Keep their topics global (no ROS namespace prefix) so every
                 # AMR in the scene targets the same /door/<id>/cmd_topic.
@@ -486,7 +478,6 @@ if not args.no_ros2:
                     door_path=str(door.GetPath()),
                     cmd_topic=cmd_topic,
                     state_topic=state_topic,
-                    open_target=open_target,
                     namespace="",
                     graph_path=f"/DoorGraph_{name}",
                 )
