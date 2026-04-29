@@ -572,6 +572,56 @@ if not args.no_ros2:
                     if limit_axis
                     else None
                 )
+                limit_cmp = (
+                    cd.get("limit_switch_comparator", "ge")
+                    if limit_axis
+                    else None
+                )
+
+                # IsaacConveyor drives surface velocity onto the belt mesh
+                # via PhysxSurfaceVelocityAPI, and PhysX only treats the mesh
+                # as a "moving surface that pushes other bodies" if it's also
+                # a kinematic RigidBody. The Isaac asset ships the belt mesh
+                # with CollisionAPI only, so apply the missing pieces here
+                # (mirrors isaacsim.asset.gen.conveyor's own commands.py).
+                from pxr import UsdPhysics
+                from pxr import PhysxSchema
+                belt = stage.GetPrimAtPath(belt_prim)
+                if belt and belt.IsValid():
+                    if not belt.HasAPI(UsdPhysics.RigidBodyAPI):
+                        rb = UsdPhysics.RigidBodyAPI.Apply(belt)
+                    else:
+                        rb = UsdPhysics.RigidBodyAPI(belt)
+                    rb.CreateKinematicEnabledAttr(True)
+                    if not belt.HasAPI(UsdPhysics.CollisionAPI):
+                        UsdPhysics.CollisionAPI.Apply(belt)
+                    if not belt.HasAPI(PhysxSchema.PhysxSurfaceVelocityAPI):
+                        PhysxSchema.PhysxSurfaceVelocityAPI.Apply(belt)
+                    print(f"[run_sim] [conveyor {conv.GetName()}] "
+                          f"applied RigidBody(kinematic)+SurfaceVelocity to "
+                          f"{belt_prim}")
+                else:
+                    print(f"[run_sim] [conveyor {conv.GetName()}] "
+                          f"belt prim not found: {belt_prim} -- skipping "
+                          f"physics API apply (IsaacConveyor will no-op)")
+
+                # The A08 belt mesh is the curved looped strip and is not
+                # watertight from above -- a small DynamicCuboid spawned on
+                # top can tunnel through and land on the kinematic Rollers
+                # body inside the conveyor frame. Rollers ship kinematic but
+                # without surface velocity, so cargo touching them stays put
+                # even when the belt is "running". Apply SurfaceVelocityAPI
+                # to Rollers so the ScriptNode can mirror the belt's surface
+                # velocity onto whatever the cargo actually contacts.
+                rollers_prim_path = f"{conv.GetPath()}/Rollers"
+                rollers = stage.GetPrimAtPath(rollers_prim_path)
+                if rollers and rollers.IsValid():
+                    if not rollers.HasAPI(PhysxSchema.PhysxSurfaceVelocityAPI):
+                        PhysxSchema.PhysxSurfaceVelocityAPI.Apply(rollers)
+                    print(f"[run_sim] [conveyor {conv.GetName()}] "
+                          f"applied SurfaceVelocity to {rollers_prim_path}")
+                else:
+                    rollers_prim_path = ""
 
                 # Conveyors, like doors, are shared infrastructure; keep the
                 # ROS2 namespace empty so any robot in the scene can drive the
@@ -584,8 +634,10 @@ if not args.no_ros2:
                     belt_surface_prim=belt_prim,
                     direction=direction,
                     box_prim=box_prim_path,
+                    rollers_prim=rollers_prim_path,
                     limit_axis=limit_axis,
                     limit_threshold=limit_thr,
+                    limit_comparator=limit_cmp,
                     namespace="",
                     graph_path=f"/ConveyorGraph_{conv.GetName()}",
                     debug=True,

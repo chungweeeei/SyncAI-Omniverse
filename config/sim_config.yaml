@@ -30,14 +30,14 @@ robots:
   #                      keeps chassis:wheel ratio near 50:1 (PhysX stable).
   - enabled: true
     model: "mir250"
-    robot_name: "MirAMR_01"
+    robot_name: "SyncRobot01"
     namespace: "robot01"
     spawn_position: [0.0, 0.0, 0.14]
     scale: 0.7
     lidar_layout: "dual_diagonal"
   - enabled: true
     model: "mir250"
-    robot_name: "MirAMR_02"
+    robot_name: "SyncRobot02"
     namespace: "robot02"
     spawn_position: [0.0, 5.0, 0.14]
     scale: 0.7
@@ -107,26 +107,36 @@ conveyors:
     # varies per Isaac variant). Pinned here so the runtime IsaacConveyor
     # node knows which surface to drive when belt motion is wired up.
     belt_surface_prim: "/World/Conveyors/conveyor_01/SM_ConveyorBelt_A08_02"
+    # `direction` is in the surface actor's LOCAL frame, not world (PhysX
+    # PhysxSurfaceVelocityAPI:surfaceVelocity is local-frame). Cargo rests
+    # on the kinematic Rollers body whose local frame is rotated by the
+    # wrapper's `rotation_z_deg=90`, so Rollers-local -X maps to world -Y
+    # -- the direction we want cargo to travel.
+    direction: [-1.0, 0.0, 0.0]
 
     # Cargo box spawned at runtime by run_sim.py (DynamicCuboid). With the
     # conveyor at position [-2, 10] rotated 90 deg, the belt occupies world
-    # X=[-2.58, -1.42], Y=[7.28, 10.00], Z=[0.05, 1.22]. Spawn just past the
-    # head end (Y=7.28) and ~0.2 m above the belt top.
+    # X=[-2.58, -1.42], Y=[7.28, 10.00], Z=[0.05, 1.22]. Spawn near the +Y
+    # tail (Y=10) and ~0.2 m above the belt top so the box has the full
+    # ~2 m run to travel toward -Y before the limit switch fires.
     test_box:
       enabled: true
       size: 0.3
       mass: 5.0
-      position: [-2.0, 7.5, 1.45]
+      position: [-2.0, 9.5, 1.45]
 
-    # Limit switch implemented as a soft gate inside the runtime ScriptNode:
-    # while box.world_pos[axis] >= threshold, effective conveyor speed is
-    # pinned to 0 and the status topic publishes "limit_triggered". When the
-    # box moves back below the threshold the commanded speed resumes.
-    # Threshold below = 0.3 m short of the tail (Y_max=10.0).
+    # Limit switch is a soft gate inside the runtime ScriptNode: when
+    # `comparator(box.world_pos[axis], threshold)` is true, effective speed
+    # is pinned to 0 and `/status` publishes "limit_triggered"; when the
+    # box moves back across the threshold the commanded speed resumes.
+    # comparator: "ge" (>=) or "le" (<=). With direction=-Y we want the
+    # gate to fire as the box approaches the -Y head end (Y_min=7.28),
+    # so use "le" with threshold 0.27 m short of the edge.
     limit_switch:
       enabled: true
       axis: "y"
-      threshold: 9.7
+      comparator: "le"
+      threshold: 7.55
 
 output:
   scene_path: "scenes/dp1f_mir.usda"

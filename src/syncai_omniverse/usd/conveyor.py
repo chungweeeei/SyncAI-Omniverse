@@ -175,6 +175,12 @@ def build_conveyor(stage: Usd.Stage, config: dict | None = None) -> str:
                 f"conveyor id={conveyor_id!r} limit_switch.axis must be "
                 f"'x'|'y'|'z' (got {axis!r})"
             )
+        comparator = str(limit.get("comparator", "ge")).lower()
+        if comparator not in ("ge", "le"):
+            raise ValueError(
+                f"conveyor id={conveyor_id!r} limit_switch.comparator must "
+                f"be 'ge'|'le' (got {comparator!r})"
+            )
         try:
             threshold = float(limit["threshold"])
         except KeyError as exc:
@@ -184,6 +190,7 @@ def build_conveyor(stage: Usd.Stage, config: dict | None = None) -> str:
             ) from exc
         prim.SetCustomDataByKey("limit_switch_enabled", True)
         prim.SetCustomDataByKey("limit_switch_axis", axis)
+        prim.SetCustomDataByKey("limit_switch_comparator", comparator)
         prim.SetCustomDataByKey("limit_switch_threshold", threshold)
     else:
         prim.SetCustomDataByKey("limit_switch_enabled", False)

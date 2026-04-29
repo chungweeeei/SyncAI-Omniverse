@@ -58,8 +58,12 @@ _state = {
     "box_prim_path": "",
     "limit_axis_idx": -1,        # -1 = limit switch disabled
     "limit_threshold": 0.0,
+    "limit_cmp_ge": True,        # True => gate when pos >= threshold (le otherwise)
     "last_state": None,
     "last_pub_time": 0.0,
+    "rollers_path": "",
+    "rollers_sv_attr": None,
+    "direction": (1.0, 0.0, 0.0),
 }
 
 # Heartbeat period for /status publishing while the string is unchanged.
@@ -109,6 +113,32 @@ def setup(db):
     axis = str(db.inputs.limitAxis).lower()
     _state["limit_axis_idx"] = {"x": 0, "y": 1, "z": 2}.get(axis, -1)
     _state["limit_threshold"] = float(db.inputs.limitThreshold)
+    try:
+        _state["limit_cmp_ge"] = str(db.inputs.limitComparator).lower() != "le"
+    except Exception:
+        _state["limit_cmp_ge"] = True
+    try:
+        _state["rollers_path"] = str(db.inputs.rollersPrim)
+    except Exception:
+        _state["rollers_path"] = ""
+    try:
+        _state["direction"] = (
+            float(db.inputs.dirX), float(db.inputs.dirY), float(db.inputs.dirZ)
+        )
+    except Exception:
+        _state["direction"] = (1.0, 0.0, 0.0)
+    # Cache the rollers' surfaceVelocity attribute. The schema only exposes
+    # this attribute after PhysxSurfaceVelocityAPI has been Apply()d in
+    # run_sim.py; if we can't grab it now we'll fall back to per-tick lookup.
+    if _state["rollers_path"]:
+        try:
+            r = _state["stage"].GetPrimAtPath(_state["rollers_path"])
+            if r and r.IsValid():
+                a = r.GetAttribute("physxSurfaceVelocity:surfaceVelocity")
+                if a and a.IsValid():
+                    _state["rollers_sv_attr"] = a
+        except Exception:
+            _state["rollers_sv_attr"] = None
 
 
 def compute(db):
@@ -147,8 +177,12 @@ def compute(db):
                 # every step, so it reflects the current sim pose.
                 t_attr = box_prim.GetAttribute("xformOp:translate")
                 pos = t_attr.Get() if t_attr else None
-                if pos is not None and pos[axis_idx] >= _state["limit_threshold"]:
-                    gated = True
+                if pos is not None:
+                    p = pos[axis_idx]
+                    thr = _state["limit_threshold"]
+                    if (_state["limit_cmp_ge"] and p >= thr) or \
+                       (not _state["limit_cmp_ge"] and p <= thr):
+                        gated = True
             except Exception:
                 gated = False
 
@@ -164,6 +198,31 @@ def compute(db):
     if vel_attr is not None:
         try:
             vel_attr.set(float(effective))
+        except Exception:
+            pass
+
+    # Mirror the belt's surface velocity onto the Rollers body. The cargo
+    # box can settle on the rollers (the belt mesh is a thin curved strip
+    # and is not watertight against tunneling), and PhysX only applies a
+    # surface push if SurfaceVelocityAPI is on the body the cargo actually
+    # contacts.
+    rsv = _state["rollers_sv_attr"]
+    if rsv is None and _state["rollers_path"]:
+        try:
+            r = _state["stage"].GetPrimAtPath(_state["rollers_path"])
+            if r and r.IsValid():
+                rsv = r.GetAttribute("physxSurfaceVelocity:surfaceVelocity")
+                if rsv and rsv.IsValid():
+                    _state["rollers_sv_attr"] = rsv
+                else:
+                    rsv = None
+        except Exception:
+            rsv = None
+    if rsv is not None:
+        try:
+            from pxr import Gf
+            d = _state["direction"]
+            rsv.Set(Gf.Vec3f(d[0] * effective, d[1] * effective, d[2] * effective))
         except Exception:
             pass
 
@@ -201,8 +260,10 @@ def attach_conveyor_controller(
     belt_surface_prim: str,
     direction: tuple = (1.0, 0.0, 0.0),
     box_prim: str | None = None,
+    rollers_prim: str | None = None,
     limit_axis: str | None = None,
     limit_threshold: float | None = None,
+    limit_comparator: str | None = None,
     namespace: str = "",
     graph_path: str | None = None,
     debug: bool = False,
@@ -216,11 +277,21 @@ def attach_conveyor_controller(
         status_topic: ROS2 std_msgs/String topic name (state machine).
         belt_surface_prim: Mesh prim that IsaacConveyor will drive (it
             applies kinematic surface velocity here).
-        direction: Belt-local direction unit vector (default forward +X).
+        direction: Surface-actor-local direction unit vector (default +X).
+            PhysxSurfaceVelocityAPI:surfaceVelocity is local-frame, so the
+            wrapper's rotation_z_deg is already baked into how this maps
+            to world.
         box_prim: Optional cargo-box prim path; passed to the ScriptNode
             for limit-switch position read. None disables the gate.
+        rollers_prim: Optional path to the asset's Rollers Xform. Cargo
+            on the A08 belt mesh can tunnel through and rest on the
+            rollers; the ScriptNode mirrors the surface velocity onto
+            this body so contact still pushes the cargo. Pass None to
+            skip the mirror.
         limit_axis: 'x'|'y'|'z' world axis name; None disables the gate.
-        limit_threshold: Trigger value; gate fires when box[axis] >= this.
+        limit_threshold: Trigger value; combined with limit_comparator.
+        limit_comparator: 'ge' (gate when pos >= threshold) or 'le' (gate
+            when pos <= threshold). Defaults to 'ge'.
         namespace: ROS2 namespace prefix for both topics.
         graph_path: Override the default /ConveyorGraph_<name> path.
         debug: Print extra diagnostics about the created nodes.
@@ -260,15 +331,24 @@ def attach_conveyor_controller(
         ("ConveyorScript.inputs:statusTopic", "string"),
         ("ConveyorScript.inputs:rosNodeName", "string"),
         ("ConveyorScript.inputs:boxPrim", "string"),
+        ("ConveyorScript.inputs:rollersPrim", "string"),
+        ("ConveyorScript.inputs:dirX", "float"),
+        ("ConveyorScript.inputs:dirY", "float"),
+        ("ConveyorScript.inputs:dirZ", "float"),
         ("ConveyorScript.inputs:limitAxis", "string"),
+        ("ConveyorScript.inputs:limitComparator", "string"),
         ("ConveyorScript.inputs:limitThreshold", "float"),
     ]
-    # IsaacConveyor is a compute-driven node (no inputs:execIn). It auto-
-    # evaluates each physics step from its `enabled` + `velocity` inputs;
-    # we only exec-trigger the subscriber and the ScriptNode.
+    # IsaacConveyor needs both its onStep execution input AND a delta-time
+    # value wired or it silently no-ops -- the OGN spec lists inputs:onStep
+    # (execution) and inputs:delta (float) as required even though `enabled`
+    # and `velocity` are set. Without these, /status reports "running" but
+    # PhysxSurfaceVelocity never gets written.
     connect = [
         ("OnPhysics.outputs:step", "SubFloat32.inputs:execIn"),
         ("OnPhysics.outputs:step", "ConveyorScript.inputs:execIn"),
+        ("OnPhysics.outputs:step", "IsaacConveyor.inputs:onStep"),
+        ("OnPhysics.outputs:deltaSimulationTime", "IsaacConveyor.inputs:delta"),
     ]
     set_values = [
         ("SubFloat32.inputs:topicName", speed_topic),
@@ -281,7 +361,13 @@ def attach_conveyor_controller(
         ("ConveyorScript.inputs:statusTopic", status_topic),
         ("ConveyorScript.inputs:rosNodeName", ros_node_name),
         ("ConveyorScript.inputs:boxPrim", box_prim or ""),
+        ("ConveyorScript.inputs:rollersPrim", rollers_prim or ""),
+        ("ConveyorScript.inputs:dirX", direction_list[0]),
+        ("ConveyorScript.inputs:dirY", direction_list[1]),
+        ("ConveyorScript.inputs:dirZ", direction_list[2]),
         ("ConveyorScript.inputs:limitAxis", limit_axis or ""),
+        ("ConveyorScript.inputs:limitComparator",
+         (limit_comparator or "ge").lower()),
         ("ConveyorScript.inputs:limitThreshold",
          float(limit_threshold) if limit_threshold is not None else 0.0),
         # IsaacConveyor reads inputs:conveyorPrim by relationship; also fall
