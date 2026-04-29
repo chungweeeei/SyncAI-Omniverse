@@ -138,5 +138,57 @@ conveyors:
       comparator: "le"
       threshold: 7.55
 
+    # AMR pickup zone. While limit_switch is firing, if any candidate
+    # robot's base_link XY is within `dock_radius` of `dock_pose`, the
+    # cargo box is switched to kinematic and pose-locked to that robot's
+    # base_link with `attach_local_offset` (in base_link local frame).
+    # Drop-off is out of scope: once carried, the box stays carried until
+    # the sim restarts.
+    pickup_target:
+      enabled: true
+      candidate_robots:
+        - "/World/SyncRobot01"
+        - "/World/SyncRobot02"
+      # World-XY of dock spot, just downstream of limit switch (~Y=7.05).
+      dock_pose: [-2.0, 7.05]
+      dock_radius: 0.6              # generous; tighten when nav2 docks well
+      # base_link-local offset for box rest pose. Tune empirically:
+      # plate top sits ~0.22 m above base_link origin (post-scale), then
+      # add ~half the box (0.15) so it visually sits on the plate.
+      attach_local_offset: [0.0, 0.0, 0.30]
+      follow_yaw: true              # box rotates with robot
+
+drop_zones:
+  # Named destinations the external task planner can drop cargo at via
+  # /cargo/drop_cmd (std_msgs/String, payload = drop-zone id). Pure
+  # registry; no visual geometry is authored. When ConveyorScript sees a
+  # drop_cmd whose payload matches an id here AND the carrying robot's
+  # base_link XY is within `radius` of `position`, it switches the cargo
+  # box back to dynamic (gravity-on) at its current pose. An empty payload
+  # or "any" skips the zone radius check (debug bypass).
+  - id: "dropoff_a"
+    # Rectangle 2.8m x 2.0m centred at world (5.85, -0.29). Map-frame
+    # corners (3.0,-2.0)/(5.8,-2.0)/(5.8,-4.0)/(3.0,-4.0) under the
+    # nav2 calibration (map = world + (-1.45, -2.71)) become the world
+    # corners listed in `boundary` below.
+    position: [5.85, -0.29]         # zone centre (XY) used for radius check
+    # 2.0 lets the robot stand at the staging point world (5.95, 1.36)
+    # (= map (4.5, -1.35), just north of the drop area) and still pass
+    # the in-zone check before "throwing" the box into the centre.
+    # Distance staging->centre is ~1.65 m.
+    radius: 2.0
+    # World pose where the box is teleported the moment its joint is
+    # removed. Box then falls from drop_pose.z under gravity. If omitted,
+    # defaults to [position.x, position.y, 0.5].
+    drop_pose: [5.85, -0.29, 1.0]
+    # Visual-only ground outline for the drop area. 4 world-XY corners,
+    # in order (the builder closes the loop). Pure cosmetic -- the radius
+    # check still uses position+radius, not this boundary.
+    boundary:
+      - [4.45,  0.71]
+      - [7.25,  0.71]
+      - [7.25, -1.29]
+      - [4.45, -1.29]
+
 output:
   scene_path: "scenes/dp1f_mir.usda"

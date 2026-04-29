@@ -195,4 +195,46 @@ def build_conveyor(stage: Usd.Stage, config: dict | None = None) -> str:
     else:
         prim.SetCustomDataByKey("limit_switch_enabled", False)
 
+    # Optional AMR pickup zone -- when limit_switch fires AND a candidate
+    # robot's base_link XY is within dock_radius of dock_pose, the runtime
+    # ScriptNode switches the cargo box to kinematic and pose-locks it to
+    # that robot's base_link with attach_local_offset.
+    pickup = cfg.get("pickup_target") or {}
+    if pickup.get("enabled"):
+        cands = pickup.get("candidate_robots") or []
+        if not cands:
+            raise ValueError(
+                f"conveyor id={conveyor_id!r} pickup_target.enabled=true but "
+                f"candidate_robots is empty"
+            )
+        try:
+            dock = pickup["dock_pose"]
+        except KeyError as exc:
+            raise KeyError(
+                f"conveyor id={conveyor_id!r} pickup_target.enabled=true but "
+                f"pickup_target.dock_pose is missing"
+            ) from exc
+        off = pickup.get("attach_local_offset", [0.0, 0.0, 0.30])
+        prim.SetCustomDataByKey("pickup_enabled", True)
+        # csv-joined string keeps customData simple; run_sim.py just splits.
+        prim.SetCustomDataByKey("pickup_candidates", ",".join(cands))
+        prim.SetCustomDataByKey(
+            "pickup_dock_xy",
+            Gf.Vec2f(float(dock[0]), float(dock[1])),
+        )
+        prim.SetCustomDataByKey(
+            "pickup_dock_radius",
+            float(pickup.get("dock_radius", 0.6)),
+        )
+        prim.SetCustomDataByKey(
+            "pickup_attach_offset",
+            Gf.Vec3f(float(off[0]), float(off[1]), float(off[2])),
+        )
+        prim.SetCustomDataByKey(
+            "pickup_follow_yaw",
+            bool(pickup.get("follow_yaw", True)),
+        )
+    else:
+        prim.SetCustomDataByKey("pickup_enabled", False)
+
     return prim_path

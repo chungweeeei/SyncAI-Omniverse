@@ -7,6 +7,7 @@ from syncai_omniverse.usd.mir_amr import build_mir_amr
 from syncai_omniverse.usd.auto_door import build_auto_door
 from syncai_omniverse.usd.charging_station import build_charging_station
 from syncai_omniverse.usd.conveyor import build_conveyor
+from syncai_omniverse.usd.drop_zone import build_drop_zones
 
 
 # Registry of available robot model builders. `robot.model` in sim_config.yaml
@@ -64,6 +65,8 @@ def build_combined_scene(output_path: str, stl_path: str, config: dict) -> str:
     for conveyor_cfg in config.get("conveyors") or []:
         build_conveyor(stage, conveyor_cfg)
 
+    build_drop_zones(stage, config.get("drop_zones") or [])
+
     stage.GetRootLayer().Save()
     return output_path
 
@@ -95,6 +98,8 @@ def build_robot_only_scene(output_path: str, config: dict) -> str:
 
     for conveyor_cfg in config.get("conveyors") or []:
         build_conveyor(stage, conveyor_cfg)
+
+    build_drop_zones(stage, config.get("drop_zones") or [])
 
     stage.GetRootLayer().Save()
     return output_path

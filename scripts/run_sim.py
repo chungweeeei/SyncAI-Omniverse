@@ -500,6 +500,38 @@ if not args.no_ros2:
         # syncai_omniverse.usd.conveyor.build_conveyor) carries the speed/
         # status topics, belt surface prim, optional cargo box config, and
         # optional limit-switch threshold -- the scene stays self-describing.
+        # Drop-zone registry (authored by build_drop_zones into
+        # /World/DropZones/<id>). Pure metadata; we collect (id, x, y, r)
+        # tuples and pass the whole list into every conveyor's controller so
+        # the ScriptNode can validate /cargo/drop_cmd payloads. The drop
+        # topic itself is a single global one (parallels /conveyor/<id>/...
+        # and /door/<id>/... -- shared infrastructure, no robot ns).
+        # Each tuple: (id, center_x, center_y, radius, drop_x, drop_y, drop_z).
+        # drop_pose was added so the box snaps to a deterministic world point
+        # at the moment of release instead of falling from wherever it was
+        # being carried. Defaults to (cx, cy, 0.5) when YAML omits drop_pose.
+        drop_zones_list: list[tuple[str, float, float, float, float, float, float]] = []
+        dz_root = stage.GetPrimAtPath("/World/DropZones")
+        if dz_root and dz_root.IsValid():
+            for dz in dz_root.GetChildren():
+                cd_z = dz.GetCustomData() or {}
+                zid = cd_z.get("drop_zone_id")
+                pxy = cd_z.get("position_xy")
+                radius = float(cd_z.get("radius", 1.0))
+                if zid and pxy is not None:
+                    cx, cy = float(pxy[0]), float(pxy[1])
+                    dpose = cd_z.get("drop_pose")
+                    if dpose is not None:
+                        dx, dy, dz_ = (
+                            float(dpose[0]), float(dpose[1]), float(dpose[2])
+                        )
+                    else:
+                        dx, dy, dz_ = cx, cy, 0.5
+                    drop_zones_list.append(
+                        (str(zid), cx, cy, radius, dx, dy, dz_)
+                    )
+        print(f"[run_sim] drop_zones={drop_zones_list}")
+
         conv_root = stage.GetPrimAtPath("/World/Conveyors")
         if conv_root and conv_root.IsValid():
             for conv in conv_root.GetChildren():
@@ -520,8 +552,14 @@ if not args.no_ros2:
                 # Optional cargo box -- spawn a DynamicCuboid at the
                 # configured world position. We do this BEFORE the controller
                 # attach so the controller can pass the box prim path into
-                # the ScriptNode for the limit-switch read.
+                # the ScriptNode for the limit-switch read. The prim name is
+                # the initial box id (e.g. "box01"); subsequent boxes are
+                # spawned by ConveyorScript via /cargo/<conv>/spawn_cmd.
                 box_prim_path = None
+                initial_box_id = "box01"
+                spawn_pos = (0.0, 0.0, 0.0)
+                spawn_size = 0.3
+                spawn_mass = 5.0
                 if cd.get("test_box_enabled"):
                     bp = cd.get("test_box_position")
                     if bp is None:
@@ -532,22 +570,25 @@ if not args.no_ros2:
                         try:
                             from isaacsim.core.api.objects import DynamicCuboid
                             import numpy as np
+                            spawn_pos = (
+                                float(bp[0]), float(bp[1]), float(bp[2])
+                            )
+                            spawn_size = float(cd.get("test_box_size", 0.3))
+                            spawn_mass = float(cd.get("test_box_mass", 5.0))
                             box_prim_path = (
-                                f"/World/CargoBoxes/box_{conv.GetName()}"
+                                f"/World/CargoBoxes/{initial_box_id}"
                             )
                             DynamicCuboid(
                                 prim_path=box_prim_path,
-                                position=np.array(
-                                    [float(bp[0]), float(bp[1]), float(bp[2])]
-                                ),
-                                size=float(cd.get("test_box_size", 0.3)),
-                                mass=float(cd.get("test_box_mass", 5.0)),
+                                position=np.array(list(spawn_pos)),
+                                size=spawn_size,
+                                mass=spawn_mass,
                                 color=np.array([0.85, 0.55, 0.10]),
                             )
                             print(f"[run_sim] [conveyor {conv.GetName()}] "
-                                  f"spawned cargo box at {box_prim_path}  "
-                                  f"pos=({float(bp[0]):.2f},"
-                                  f"{float(bp[1]):.2f},{float(bp[2]):.2f})")
+                                  f"spawned cargo box {initial_box_id} at "
+                                  f"{box_prim_path}  pos=({spawn_pos[0]:.2f},"
+                                  f"{spawn_pos[1]:.2f},{spawn_pos[2]:.2f})")
                         except Exception as exc:
                             print(f"[run_sim] [conveyor {conv.GetName()}] "
                                   f"DynamicCuboid spawn failed: {exc}")
@@ -568,6 +609,34 @@ if not args.no_ros2:
                     if limit_axis
                     else None
                 )
+
+                # Pickup target wiring (box -> AMR top handoff). When the
+                # limit switch fires AND a candidate robot's base_link XY is
+                # within dock_radius of dock_pose, the ScriptNode flips the
+                # box to kinematic and pose-locks it to that robot.
+                pickup_enabled = bool(cd.get("pickup_enabled", False))
+                pickup_candidates: list[str] = []
+                pickup_dock_xy = (0.0, 0.0)
+                pickup_dock_radius = 0.6
+                pickup_attach_offset = (0.0, 0.0, 0.30)
+                pickup_follow_yaw = True
+                if pickup_enabled:
+                    cands_csv = str(cd.get("pickup_candidates", ""))
+                    pickup_candidates = [c for c in cands_csv.split(",") if c]
+                    dxy = cd.get("pickup_dock_xy")
+                    if dxy is not None:
+                        pickup_dock_xy = (float(dxy[0]), float(dxy[1]))
+                    pickup_dock_radius = float(
+                        cd.get("pickup_dock_radius", 0.6)
+                    )
+                    aoff = cd.get("pickup_attach_offset")
+                    if aoff is not None:
+                        pickup_attach_offset = (
+                            float(aoff[0]),
+                            float(aoff[1]),
+                            float(aoff[2]),
+                        )
+                    pickup_follow_yaw = bool(cd.get("pickup_follow_yaw", True))
 
                 # IsaacConveyor drives surface velocity onto the belt mesh
                 # via PhysxSurfaceVelocityAPI, and PhysX only treats the mesh
@@ -629,6 +698,19 @@ if not args.no_ros2:
                     limit_axis=limit_axis,
                     limit_threshold=limit_thr,
                     limit_comparator=limit_cmp,
+                    pickup_enabled=pickup_enabled,
+                    pickup_candidates=pickup_candidates,
+                    pickup_dock_xy=pickup_dock_xy,
+                    pickup_dock_radius=pickup_dock_radius,
+                    pickup_attach_offset=pickup_attach_offset,
+                    pickup_follow_yaw=pickup_follow_yaw,
+                    drop_cmd_topic="/cargo/drop_cmd",
+                    drop_zones=drop_zones_list,
+                    spawn_cmd_topic=f"/cargo/{conv.GetName()}/spawn_cmd",
+                    initial_box_id=initial_box_id,
+                    box_spawn_position=spawn_pos,
+                    box_spawn_size=spawn_size,
+                    box_spawn_mass=spawn_mass,
                     namespace="",
                     graph_path=f"/ConveyorGraph_{conv.GetName()}",
                     debug=True,
