@@ -73,6 +73,15 @@ _state = {
     "pickup_dock_radius_sq": 0.0,
     "pickup_offset": (0.0, 0.0, 0.0),
     "pickup_follow_yaw": True,
+    # Pickup is request-driven: a robot must publish on
+    # /cargo/<conv>/pickup_cmd (std_msgs/String) to request attach. Payload
+    # forms: "box_id:robot_id" (strict), "robot_id" (no box check),
+    # "any" (debug, picks closest in-zone candidate). Empty is skipped.
+    # Validation rejects with /status="pickup_rejected:<reason>" if the
+    # request arrives while phase!=handoff, robot not in candidates, or
+    # robot's base_link XY outside dock_radius.
+    "pickup_cmd_attr": None,
+    "last_pickup_cmd_text": "",
     "phase": "belt",             # belt | handoff | carried | dropped
     "carried_base_link": "",     # winning base_link prim path
     # Carry is implemented via a UsdPhysics.FixedJoint between the robot's
@@ -253,6 +262,14 @@ def setup(db):
         )
     except Exception:
         _state["spawn_cmd_attr"] = None
+
+    # Pickup-cmd subscriber wiring (request-driven attach).
+    try:
+        _state["pickup_cmd_attr"] = og.Controller.attribute(
+            str(db.inputs.pickupCmdAttrPath)
+        )
+    except Exception:
+        _state["pickup_cmd_attr"] = None
 
     # Initial box id (spawned by run_sim.py before the graph attaches) and
     # seed the auto-increment counter from any trailing digits so the
@@ -536,69 +553,24 @@ def compute(db):
 
     effective = 0.0 if gated else cmd
 
-    # Pickup / handoff state machine. Runs only when configured AND there is
-    # a box prim to chase. Belt motion is unaffected -- carry mode is purely
-    # additive: it pose-locks the box on top of a robot once that robot
-    # arrives in the dock zone.
+    # Pickup / handoff state machine. Carry transitions are now driven by
+    # /cargo/<conv>/pickup_cmd (handled below), NOT by simply detecting a
+    # robot in the dock zone. This block only tracks belt <-> handoff so
+    # the published /status reflects whether the box is at the pickup
+    # position waiting for a request.
     phase = _state.get("phase", "belt")
     if _state["pickup_enabled"] and box_path:
         stage = _state["stage"]
         box_prim = stage.GetPrimAtPath(box_path) if stage is not None else None
 
-        chosen = ""
-        if gated and box_prim and box_prim.IsValid():
-            from pxr import UsdGeom, Usd
-            dock_x, dock_y = _state["pickup_dock_xy"]
-            r2 = _state["pickup_dock_radius_sq"]
-            best_d2 = float("inf")
-            for bl_path in _state["pickup_candidates"]:
-                rp = stage.GetPrimAtPath(bl_path)
-                if not (rp and rp.IsValid()):
-                    continue
-                try:
-                    xf = UsdGeom.Xformable(rp).ComputeLocalToWorldTransform(
-                        Usd.TimeCode.Default()
-                    )
-                    wp = xf.ExtractTranslation()
-                    dx = wp[0] - dock_x
-                    dy = wp[1] - dock_y
-                    d2 = dx * dx + dy * dy
-                    if d2 <= r2 and d2 < best_d2:
-                        best_d2 = d2
-                        chosen = bl_path
-                except Exception:
-                    pass
-
-        # Phase transitions. carried -> dropped is handled in the drop-cmd
-        # block below; this block only handles belt/handoff -> carried.
-        if phase == "belt":
-            if gated and chosen:
-                phase = "carried"
-                _state["carried_base_link"] = chosen
-                if box_prim and box_prim.IsValid():
-                    _enter_carried(
-                        box_prim,
-                        chosen,
-                        _state["pickup_offset"],
-                        _state["pickup_follow_yaw"],
-                    )
-            elif gated:
-                phase = "handoff"
-        elif phase == "handoff":
-            if not gated:
-                phase = "belt"
-            elif chosen:
-                phase = "carried"
-                _state["carried_base_link"] = chosen
-                if box_prim and box_prim.IsValid():
-                    _enter_carried(
-                        box_prim,
-                        chosen,
-                        _state["pickup_offset"],
-                        _state["pickup_follow_yaw"],
-                    )
-        # During `carried` phase the FixedJoint authored by _enter_carried
-        # holds the box on the robot; no per-tick xformOp writes needed.
+        if phase == "belt" and gated:
+            phase = "handoff"
+        elif phase == "handoff" and not gated:
+            phase = "belt"
+        # `handoff` -> `carried` is reached only when a valid pickup_cmd is
+        # received (see the pickup-cmd block further down). During
+        # `carried` the FixedJoint authored by _enter_carried holds the box
+        # on the robot; no per-tick xformOp writes needed.
 
         _state["phase"] = phase
 
@@ -644,6 +616,143 @@ def compute(db):
             _state["carry_joint_path"] = ""
             _state["carried_base_link"] = ""
             print(f"[conveyor] respawned: phase=belt box={new_id}")
+
+    # Pickup-cmd handling. Request-driven attach. Payload forms:
+    #   "box_id:robot_id"  -- strict; both checked
+    #   "robot_id"         -- only robot is checked, no box-id verification
+    #   "any"              -- debug; picks the closest in-zone candidate
+    # Validation order: phase must be handoff (limit fired) -> box id matches
+    # (if specified) -> robot id resolves to a candidate -> robot's base_link
+    # XY within dock_radius. First failure wins, published as
+    # /status="pickup_rejected:<reason>" for one tick.
+    pickup_status_override = ""
+    pca = _state["pickup_cmd_attr"]
+    if pca is None:
+        try:
+            _state["pickup_cmd_attr"] = og.Controller.attribute(
+                str(db.inputs.pickupCmdAttrPath)
+            )
+            pca = _state["pickup_cmd_attr"]
+        except Exception:
+            pca = None
+    pickup_text = ""
+    if pca is not None:
+        try:
+            v = pca.get()
+            pickup_text = str(v) if v else ""
+        except Exception:
+            pickup_text = ""
+
+    if pickup_text and pickup_text != _state["last_pickup_cmd_text"]:
+        _state["last_pickup_cmd_text"] = pickup_text
+        print(
+            f"[conveyor] pickup_cmd RX text={pickup_text!r} "
+            f"phase={_state.get('phase')!r} "
+            f"current_box={_state.get('current_box_id')!r}"
+        )
+
+        incoming_box_id = ""
+        robot_id_text = pickup_text
+        if pickup_text not in ("any", "") and ":" in pickup_text:
+            incoming_box_id, robot_id_text = pickup_text.split(":", 1)
+
+        reject = ""
+        chosen_bl = ""
+        phase_at_req = _state.get("phase", "belt")
+
+        if not _state["pickup_enabled"]:
+            reject = "pickup_disabled"
+        elif phase_at_req == "carried":
+            reject = "already_carried"
+        elif phase_at_req == "dropped":
+            reject = "already_dropped"
+        elif phase_at_req != "handoff":
+            # Limit switch hasn't fired -- box not yet at pickup position.
+            reject = "not_at_pickup"
+        elif incoming_box_id and incoming_box_id != _state.get("current_box_id", ""):
+            reject = "wrong_box"
+        else:
+            from pxr import UsdGeom, Usd
+            stage_local = _state["stage"]
+            dock_x, dock_y = _state["pickup_dock_xy"]
+            r2 = _state["pickup_dock_radius_sq"]
+
+            if robot_id_text == "any":
+                # Debug bypass: pick closest in-zone candidate.
+                best_d2 = float("inf")
+                for bl_path in _state["pickup_candidates"]:
+                    rp = stage_local.GetPrimAtPath(bl_path)
+                    if not (rp and rp.IsValid()):
+                        continue
+                    try:
+                        xf = UsdGeom.Xformable(rp).ComputeLocalToWorldTransform(
+                            Usd.TimeCode.Default()
+                        )
+                        wp = xf.ExtractTranslation()
+                        dx = wp[0] - dock_x
+                        dy = wp[1] - dock_y
+                        d2 = dx * dx + dy * dy
+                        if d2 <= r2 and d2 < best_d2:
+                            best_d2 = d2
+                            chosen_bl = bl_path
+                    except Exception:
+                        pass
+                if not chosen_bl:
+                    reject = "robot_not_in_zone"
+            else:
+                # Match request against candidates: accept full prim path
+                # ("/World/SyncRobot01") or basename ("SyncRobot01").
+                req = robot_id_text.strip().rstrip("/")
+                matched_bl = ""
+                for bl_path in _state["pickup_candidates"]:
+                    root = bl_path.rsplit("/", 1)[0]
+                    root_basename = root.rsplit("/", 1)[-1]
+                    if req == root or req == root_basename:
+                        matched_bl = bl_path
+                        break
+                if not matched_bl:
+                    reject = "unknown_robot"
+                else:
+                    rp = stage_local.GetPrimAtPath(matched_bl)
+                    in_zone = False
+                    if rp and rp.IsValid():
+                        try:
+                            xf = UsdGeom.Xformable(rp).ComputeLocalToWorldTransform(
+                                Usd.TimeCode.Default()
+                            )
+                            wp = xf.ExtractTranslation()
+                            dx = wp[0] - dock_x
+                            dy = wp[1] - dock_y
+                            if dx * dx + dy * dy <= r2:
+                                in_zone = True
+                        except Exception:
+                            in_zone = False
+                    if in_zone:
+                        chosen_bl = matched_bl
+                    else:
+                        reject = "robot_not_in_zone"
+
+        if reject:
+            pickup_status_override = f"pickup_rejected:{reject}"
+            print(
+                f"[conveyor] pickup_cmd rejected: {reject} "
+                f"(cmd={pickup_text!r} phase={phase_at_req!r})"
+            )
+        elif chosen_bl and box_path:
+            box_prim_p = _state["stage"].GetPrimAtPath(box_path)
+            if box_prim_p and box_prim_p.IsValid():
+                _enter_carried(
+                    box_prim_p,
+                    chosen_bl,
+                    _state["pickup_offset"],
+                    _state["pickup_follow_yaw"],
+                )
+                _state["phase"] = "carried"
+                _state["carried_base_link"] = chosen_bl
+                print(
+                    f"[conveyor] pickup_cmd accepted: {pickup_text!r} -> "
+                    f"{chosen_bl}"
+                )
 
     # Drop-cmd handling. Polls every tick; only acts on each unique non-empty
     # payload once (deduped via last_drop_cmd_text). To retry after a reject,
@@ -775,7 +884,11 @@ def compute(db):
 
     phase_now = _state.get("phase")
     bid = _state.get("current_box_id", "")
-    if drop_status_override:
+    if pickup_status_override:
+        # One-shot pickup-reject notice; phase didn't change so next tick
+        # falls back to whatever the resumed state is.
+        state_str = pickup_status_override
+    elif drop_status_override:
         # One-shot rejection notice; phase didn't change so next tick falls
         # back to whatever the resumed state is.
         state_str = drop_status_override
@@ -801,7 +914,9 @@ def compute(db):
         else:
             state_str = "carried"
     elif phase_now == "handoff":
-        state_str = "handoff"
+        # Include box_id so /cargo/pending aggregator can populate the
+        # entry without needing a separate channel for it.
+        state_str = f"handoff:{bid}" if bid else "handoff"
     elif gated:
         state_str = "limit_triggered"
     elif abs(effective) > _STOPPED_EPS:
@@ -849,6 +964,7 @@ def attach_conveyor_controller(
     drop_cmd_topic: str = "/cargo/drop_cmd",
     drop_zones: list | None = None,
     spawn_cmd_topic: str = "",
+    pickup_cmd_topic: str = "",
     initial_box_id: str = "box01",
     box_spawn_position: tuple = (0.0, 0.0, 0.0),
     box_spawn_size: float = 0.3,
@@ -902,11 +1018,16 @@ def attach_conveyor_controller(
     if not spawn_cmd_topic:
         spawn_cmd_topic = f"/cargo/{conv_prim.GetName()}/spawn_cmd"
     spawn_cmd_topic_full = _apply_namespace(namespace, spawn_cmd_topic)
+    # Default pickup topic per-conveyor (parallels spawn_cmd convention).
+    if not pickup_cmd_topic:
+        pickup_cmd_topic = f"/cargo/{conv_prim.GetName()}/pickup_cmd"
+    pickup_cmd_topic_full = _apply_namespace(namespace, pickup_cmd_topic)
     graph_path = graph_path or f"/ConveyorGraph_{conv_prim.GetName()}"
     sub_attr_path = f"{graph_path}/SubFloat32.outputs:data"
     vel_attr_path = f"{graph_path}/IsaacConveyor.inputs:velocity"
     drop_cmd_attr_path = f"{graph_path}/SubDropCmd.outputs:data"
     spawn_cmd_attr_path = f"{graph_path}/SubSpawnCmd.outputs:data"
+    pickup_cmd_attr_path = f"{graph_path}/SubPickupCmd.outputs:data"
     # Per-conveyor rclpy node name -- must be unique across conveyors so
     # multiple ConveyorGraph_* in the same process don't collide.
     ros_node_name = f"conveyor_{conv_prim.GetName()}_status_pub".replace("/", "_")
@@ -920,6 +1041,7 @@ def attach_conveyor_controller(
         ("SubFloat32", "isaacsim.ros2.bridge.ROS2Subscriber"),
         ("SubDropCmd", "isaacsim.ros2.bridge.ROS2Subscriber"),
         ("SubSpawnCmd", "isaacsim.ros2.bridge.ROS2Subscriber"),
+        ("SubPickupCmd", "isaacsim.ros2.bridge.ROS2Subscriber"),
         ("ConveyorScript", "omni.graph.scriptnode.ScriptNode"),
         ("IsaacConveyor", "isaacsim.asset.gen.conveyor.IsaacConveyor"),
     ]
@@ -948,6 +1070,7 @@ def attach_conveyor_controller(
         ("ConveyorScript.inputs:dropCmdAttrPath", "string"),
         ("ConveyorScript.inputs:dropZones", "string"),
         ("ConveyorScript.inputs:spawnCmdAttrPath", "string"),
+        ("ConveyorScript.inputs:pickupCmdAttrPath", "string"),
         ("ConveyorScript.inputs:initialBoxId", "string"),
         ("ConveyorScript.inputs:boxSpawnX", "float"),
         ("ConveyorScript.inputs:boxSpawnY", "float"),
@@ -964,6 +1087,7 @@ def attach_conveyor_controller(
         ("OnPhysics.outputs:step", "SubFloat32.inputs:execIn"),
         ("OnPhysics.outputs:step", "SubDropCmd.inputs:execIn"),
         ("OnPhysics.outputs:step", "SubSpawnCmd.inputs:execIn"),
+        ("OnPhysics.outputs:step", "SubPickupCmd.inputs:execIn"),
         ("OnPhysics.outputs:step", "ConveyorScript.inputs:execIn"),
         ("OnPhysics.outputs:step", "IsaacConveyor.inputs:onStep"),
         ("OnPhysics.outputs:deltaSimulationTime", "IsaacConveyor.inputs:delta"),
@@ -1018,6 +1142,11 @@ def attach_conveyor_controller(
         ("SubSpawnCmd.inputs:messageSubfolder", "msg"),
         ("SubSpawnCmd.inputs:messageName", "String"),
         ("ConveyorScript.inputs:spawnCmdAttrPath", spawn_cmd_attr_path),
+        ("SubPickupCmd.inputs:topicName", pickup_cmd_topic_full),
+        ("SubPickupCmd.inputs:messagePackage", "std_msgs"),
+        ("SubPickupCmd.inputs:messageSubfolder", "msg"),
+        ("SubPickupCmd.inputs:messageName", "String"),
+        ("ConveyorScript.inputs:pickupCmdAttrPath", pickup_cmd_attr_path),
         ("ConveyorScript.inputs:initialBoxId", initial_box_id),
         ("ConveyorScript.inputs:boxSpawnX", float(box_spawn_position[0])),
         ("ConveyorScript.inputs:boxSpawnY", float(box_spawn_position[1])),
@@ -1082,6 +1211,7 @@ def attach_conveyor_controller(
         f"initial_id={initial_box_id} pos={tuple(float(v) for v in box_spawn_position)} "
         f"size={float(box_spawn_size)} mass={float(box_spawn_mass)}"
     )
+    print(f"[conveyor]   pickup_cmd: topic={pickup_cmd_topic_full}")
 
     if debug:
         print("[conveyor][debug] nodes:")

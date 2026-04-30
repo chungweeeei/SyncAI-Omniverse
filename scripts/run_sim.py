@@ -532,6 +532,12 @@ if not args.no_ros2:
                     )
         print(f"[run_sim] drop_zones={drop_zones_list}")
 
+        # Collected during the conveyor loop and consumed by
+        # attach_pending_publisher() afterwards. Only conveyors with a
+        # pickup_target enter the list -- /cargo/pending is a fleet-dispatch
+        # signal, not a generic conveyor monitor.
+        pending_conveyors: list[tuple[str, str]] = []
+
         conv_root = stage.GetPrimAtPath("/World/Conveyors")
         if conv_root and conv_root.IsValid():
             for conv in conv_root.GetChildren():
@@ -707,6 +713,7 @@ if not args.no_ros2:
                     drop_cmd_topic="/cargo/drop_cmd",
                     drop_zones=drop_zones_list,
                     spawn_cmd_topic=f"/cargo/{conv.GetName()}/spawn_cmd",
+                    pickup_cmd_topic=f"/cargo/{conv.GetName()}/pickup_cmd",
                     initial_box_id=initial_box_id,
                     box_spawn_position=spawn_pos,
                     box_spawn_size=spawn_size,
@@ -715,6 +722,21 @@ if not args.no_ros2:
                     graph_path=f"/ConveyorGraph_{conv.GetName()}",
                     debug=True,
                 )
+
+                if pickup_enabled:
+                    pending_conveyors.append(
+                        (conv.GetName(), status_topic)
+                    )
+
+        if pending_conveyors:
+            from syncai_omniverse.ros2.pending_publisher import (
+                attach_pending_publisher,
+            )
+            attach_pending_publisher(
+                stage,
+                conveyors_info=pending_conveyors,
+                topic="/cargo/pending",
+            )
 
 omni.timeline.get_timeline_interface().play()
 
