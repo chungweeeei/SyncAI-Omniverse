@@ -64,6 +64,15 @@ _state = {
     "rollers_path": "",
     "rollers_sv_attr": None,
     "direction": (1.0, 0.0, 0.0),
+    # Auto-running: when no /conveyor/<id>/speed_cmd has arrived yet, the
+    # belt runs at `default_speed`. The first time we observe a NON-ZERO
+    # value out of the subscriber we flip `speed_cmd_received` and start
+    # honouring sub.get() literally (so subsequent 0.0 publishes can stop
+    # the belt). Caveat: if the first publish is exactly 0.0, the flag
+    # never flips -- to stop a default-running belt without ever moving
+    # it, publish a tiny epsilon then 0.0.
+    "default_speed": 0.0,
+    "speed_cmd_received": False,
     # Pickup / handoff state machine. While `phase == "carried"` the box is
     # kinematic and its world transform is rewritten each tick from the
     # winning robot's base_link pose * attach_local_offset.
@@ -170,6 +179,10 @@ def setup(db):
         )
     except Exception:
         _state["direction"] = (1.0, 0.0, 0.0)
+    try:
+        _state["default_speed"] = float(db.inputs.defaultSpeed)
+    except Exception:
+        _state["default_speed"] = 0.0
     # Cache the rollers' surfaceVelocity attribute. The schema only exposes
     # this attribute after PhysxSurfaceVelocityAPI has been Apply()d in
     # run_sim.py; if we can't grab it now we'll fall back to per-tick lookup.
@@ -271,17 +284,20 @@ def setup(db):
     except Exception:
         _state["pickup_cmd_attr"] = None
 
-    # Initial box id (spawned by run_sim.py before the graph attaches) and
-    # seed the auto-increment counter from any trailing digits so the
-    # first auto-generated id is +1 of the initial.
+    # No box exists at startup -- the first one is spawned via /cargo/<conv>/
+    # spawn_cmd. The auto-increment counter is seeded from initial_box_id's
+    # trailing digits MINUS 1 so a first "any" payload reproduces the
+    # configured initial_box_id (e.g. initial_box_id="box01" -> first 'any'
+    # spawn yields "box01"; initial_box_id="box05" -> first 'any' yields
+    # "box05"). An explicit id in the payload always wins over the counter.
+    _state["current_box_id"] = ""
     try:
         initial = str(db.inputs.initialBoxId) or "box01"
     except Exception:
         initial = "box01"
-    _state["current_box_id"] = initial
     import re as _re
     _m = _re.search(r"(\d+)$", initial)
-    _state["box_count"] = int(_m.group(1)) if _m else 1
+    _state["box_count"] = (int(_m.group(1)) - 1) if _m else 0
 
     # Spawn config used by _spawn_box for every subsequent box on this
     # conveyor (size / mass / spawn position match the YAML test_box).
@@ -517,14 +533,23 @@ def compute(db):
         except Exception:
             sub = None
 
-    cmd = 0.0
+    # Speed command resolution:
+    #   1. Default to `default_speed` (auto-run on startup if non-zero).
+    #   2. Once we observe a non-zero sub.get() at least once, flip
+    #      `speed_cmd_received` and from that point honour sub.get()
+    #      literally -- a subsequent publish of 0.0 will stop the belt.
+    v = None
     if sub is not None:
         try:
             v = sub.get()
-            if v is not None:
-                cmd = float(v)
         except Exception:
-            cmd = 0.0
+            v = None
+    if v is not None and float(v) != 0.0:
+        _state["speed_cmd_received"] = True
+    if _state["speed_cmd_received"]:
+        cmd = float(v) if v is not None else 0.0
+    else:
+        cmd = _state["default_speed"]
 
     # Limit-switch gate: pin effective velocity to 0 while the box is past
     # the configured world-axis threshold. Skipped entirely if no box prim
@@ -596,9 +621,18 @@ def compute(db):
 
     if spawn_text and spawn_text != _state["last_spawn_cmd_text"]:
         _state["last_spawn_cmd_text"] = spawn_text
-        if _state.get("phase") != "dropped":
+        phase_now = _state.get("phase")
+        has_box = bool(_state.get("box_prim_path", ""))
+        # Accept spawn when:
+        #   1. phase == "dropped" (existing respawn-after-dropoff flow), OR
+        #   2. no current box (startup state -- first box ever, OR after an
+        #      operator manually deleted the box prim).
+        # Reject when a box is in flight (belt/handoff/carried) so we don't
+        # silently strand or duplicate cargo.
+        if phase_now != "dropped" and has_box:
             print(
-                f"[conveyor] spawn_cmd ignored (phase={_state.get('phase')!r})"
+                f"[conveyor] spawn_cmd ignored "
+                f"(phase={phase_now!r} has_box={has_box})"
             )
         else:
             # Auto-increment when payload is empty/any/sentinel; otherwise
@@ -612,10 +646,11 @@ def compute(db):
             _state["phase"] = "belt"
             _state["dropped_zone"] = ""
             _state["last_drop_cmd_text"] = ""   # next drop is fresh
+            _state["last_pickup_cmd_text"] = "" # next pickup is fresh
             _state["carry_active"] = False
             _state["carry_joint_path"] = ""
             _state["carried_base_link"] = ""
-            print(f"[conveyor] respawned: phase=belt box={new_id}")
+            print(f"[conveyor] spawned: phase=belt box={new_id}")
 
     # Pickup-cmd handling. Request-driven attach. Payload forms:
     #   "box_id:robot_id"  -- strict; both checked
@@ -955,6 +990,7 @@ def attach_conveyor_controller(
     limit_axis: str | None = None,
     limit_threshold: float | None = None,
     limit_comparator: str | None = None,
+    default_speed: float = 0.0,
     pickup_enabled: bool = False,
     pickup_candidates: list | None = None,
     pickup_dock_xy: tuple | None = None,
@@ -1055,6 +1091,7 @@ def attach_conveyor_controller(
         ("ConveyorScript.inputs:dirX", "float"),
         ("ConveyorScript.inputs:dirY", "float"),
         ("ConveyorScript.inputs:dirZ", "float"),
+        ("ConveyorScript.inputs:defaultSpeed", "float"),
         ("ConveyorScript.inputs:limitAxis", "string"),
         ("ConveyorScript.inputs:limitComparator", "string"),
         ("ConveyorScript.inputs:limitThreshold", "float"),
@@ -1107,6 +1144,7 @@ def attach_conveyor_controller(
         ("ConveyorScript.inputs:dirX", direction_list[0]),
         ("ConveyorScript.inputs:dirY", direction_list[1]),
         ("ConveyorScript.inputs:dirZ", direction_list[2]),
+        ("ConveyorScript.inputs:defaultSpeed", float(default_speed)),
         ("ConveyorScript.inputs:limitAxis", limit_axis or ""),
         ("ConveyorScript.inputs:limitComparator",
          (limit_comparator or "ge").lower()),
@@ -1157,7 +1195,10 @@ def attach_conveyor_controller(
         # back to the string-typed targetPrim shape used by some 5.x revs by
         # writing the path. The node implementation accepts the empty
         # rel + path-string combo and resolves it at evaluate.
-        ("IsaacConveyor.inputs:velocity", 0.0),
+        # Start the belt at default_speed so the very first physics tick
+        # (before ConveyorScript.compute() runs) already has the right
+        # surface velocity authored on the kinematic mesh.
+        ("IsaacConveyor.inputs:velocity", float(default_speed)),
         ("IsaacConveyor.inputs:direction", direction_list),
         ("IsaacConveyor.inputs:enabled", True),
     ]
@@ -1190,7 +1231,8 @@ def attach_conveyor_controller(
 
     print(f"[conveyor] graph={graph_path}  cmd={speed_topic}  "
           f"status={status_topic}")
-    print(f"[conveyor]   belt={belt_surface_prim}  direction={direction_list}")
+    print(f"[conveyor]   belt={belt_surface_prim}  direction={direction_list}  "
+          f"default_speed={float(default_speed):.3f}")
     if box_prim:
         print(f"[conveyor]   box={box_prim}")
     if limit_axis is not None and limit_threshold is not None:

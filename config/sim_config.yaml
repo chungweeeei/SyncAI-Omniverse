@@ -113,12 +113,22 @@ conveyors:
     # wrapper's `rotation_z_deg=90`, so Rollers-local -X maps to world -Y
     # -- the direction we want cargo to travel.
     direction: [-1.0, 0.0, 0.0]
+    # Belt auto-runs at this surface speed (m/s) on sim startup. Once
+    # /conveyor/conveyor_01/speed_cmd publishes any non-zero value the
+    # ScriptNode switches to honouring sub.get() literally (so a
+    # subsequent 0.0 publish stops the belt).
+    default_speed: 1.0
 
-    # Cargo box spawned at runtime by run_sim.py (DynamicCuboid). With the
-    # conveyor at position [-2, 10] rotated 90 deg, the belt occupies world
-    # X=[-2.58, -1.42], Y=[7.28, 10.00], Z=[0.05, 1.22]. Spawn near the +Y
-    # tail (Y=10) and ~0.2 m above the belt top so the box has the full
-    # ~2 m run to travel toward -Y before the limit switch fires.
+    # Default spawn pose / size / mass for every box created via
+    # /cargo/conveyor_01/spawn_cmd. With the conveyor at position [-2, 10]
+    # rotated 90 deg, the belt occupies world X=[-2.58, -1.42],
+    # Y=[7.28, 10.00], Z=[0.05, 1.22]. Spawn near the +Y tail (Y=10) and
+    # ~0.2 m above the belt top so the box has the full ~2 m run to
+    # travel toward -Y before the limit switch fires.
+    # `enabled: true` was historically the toggle for run_sim.py's auto-
+    # spawn-on-startup. After the request-driven refactor it just gates
+    # whether these spawn parameters get baked into customData; leave it
+    # true so spawn_cmd uses the configured pose.
     test_box:
       enabled: true
       size: 0.3

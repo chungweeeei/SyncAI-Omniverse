@@ -139,18 +139,6 @@ parser.add_argument(
     help="Skip /cmd_vel -> DifferentialController -> ArticulationController graph.",
 )
 parser.add_argument(
-    "--debug-cmdvel",
-    action="store_true",
-    help="Verbose cmd_vel graph build log + periodic runtime snapshot of live values.",
-)
-parser.add_argument(
-    "--debug-pose",
-    action="store_true",
-    help="Every 0.5s, print the robot base_link world pose (xyz + roll/pitch/yaw "
-         "in degrees) and linear/angular velocity. Use to diagnose stuck/flip/pivot "
-         "problems -- e.g. pitch ~180 means the chassis flipped onto its back.",
-)
-parser.add_argument(
     "--no-lidar",
     action="store_true",
     help="Skip RTX lidar + /scan publisher.",
@@ -193,7 +181,7 @@ parser.add_argument(
     default=None,
     choices=["single_center", "dual_diagonal"],
     help="Lidar mounting pattern. single_center: one RTX lidar on one mount "
-         "point, publishing to --cmd-vel-topic-style single /scan. "
+         "point, publishing to a single /scan. "
          "dual_diagonal: two RTX lidars at front-left + rear-right, publishing "
          "/scan_front + /scan_rear on separate graphs (matches real MiR250 "
          "safety-lidar layout). Defaults to dual_diagonal.",
@@ -211,21 +199,6 @@ parser.add_argument(
     default="scan",
     help="For single_center layouts, ROS frame_id used in the /scan message "
          "header. Ignored for dual_diagonal (frames are `scan_front` + `scan_rear`).",
-)
-parser.add_argument(
-    "--cmd-vel-topic",
-    default="/cmd_vel_smoothed",
-    help="Topic suffix the sim subscribes to for Twist commands (per-robot "
-         "namespace is auto-prepended). Defaults to the nav2 velocity_smoother "
-         "output. Several nav2 publishers race on raw /cmd_vel, producing a "
-         "0/v sawtooth our wheel drive can't integrate. Override to "
-         "/cmd_vel when running without nav2 (e.g. raw teleop_twist_keyboard).",
-)
-parser.add_argument(
-    "--debug-pose-robot",
-    default=None,
-    help="`robot_name` whose base_link to probe for --debug-pose. Defaults "
-         "to the first enabled robot in sim_config.yaml.",
 )
 args = parser.parse_args()
 
@@ -264,15 +237,6 @@ if args.lidar_layout is not None:
 if args.tf_targets is not None:
     for r in ROBOTS:
         r["tf_targets"] = args.tf_targets
-
-# Pick which robot --debug-pose probes (default: first robot).
-_pose_robot_name = args.debug_pose_robot or ROBOTS[0]["robot_name"]
-_pose_robot = next((r for r in ROBOTS if r["robot_name"] == _pose_robot_name), None)
-if _pose_robot is None:
-    raise SystemExit(
-        f"--debug-pose-robot={_pose_robot_name!r} not found among "
-        f"{[r['robot_name'] for r in ROBOTS]}"
-    )
 
 # SimulationApp MUST be instantiated before importing any omni/pxr/isaacsim modules.
 from isaacsim import SimulationApp
@@ -320,10 +284,7 @@ if not args.no_ros2:
     if not args.no_odom:
         from syncai_omniverse.ros2.odom_publisher import attach_odom_publisher
     if not args.no_cmdvel:
-        from syncai_omniverse.ros2.cmd_vel_subscriber import (
-            attach_cmd_vel_subscriber,
-            print_cmd_vel_snapshot,
-        )
+        from syncai_omniverse.ros2.cmd_vel_subscriber import attach_cmd_vel_subscriber
     if not args.no_lidar:
         from isaacsim.core.utils.extensions import enable_extension as _enable_ext
 
@@ -371,12 +332,12 @@ if not args.no_ros2:
 
         # -- cmd_vel subscriber --
         if not args.no_cmdvel:
+            _cmd_vel_topic = "/cmd_vel_smoothed"
             attach_cmd_vel_subscriber(
                 stage,
                 robot_path=rp,
                 namespace=ns,
-                debug=args.debug_cmdvel,
-                topic=args.cmd_vel_topic,
+                topic=_cmd_vel_topic,
                 wheel_radius=r["wheel_radius"],
                 wheel_distance=r["wheel_distance"],
                 wheel_drive_damping=r["wheel_drive_damping"],
@@ -386,7 +347,7 @@ if not args.no_ros2:
                 max_angular_accel=r["max_angular_accel"],
                 graph_path=_graph_path(ns, "CmdVelActionGraph"),
             )
-            print(f"[run_sim] [{r['robot_name']}] cmd_vel: {ns_log}{args.cmd_vel_topic} "
+            print(f"[run_sim] [{r['robot_name']}] cmd_vel: {ns_log}{_cmd_vel_topic} "
                   f"(r={r['wheel_radius']:.3f}, d={r['wheel_distance']:.3f})")
 
         # -- Lidar (per-robot, layout-dependent) --
@@ -555,12 +516,11 @@ if not args.no_ros2:
                 else:
                     direction = (float(dir_v[0]), float(dir_v[1]), float(dir_v[2]))
 
-                # Optional cargo box -- spawn a DynamicCuboid at the
-                # configured world position. We do this BEFORE the controller
-                # attach so the controller can pass the box prim path into
-                # the ScriptNode for the limit-switch read. The prim name is
-                # the initial box id (e.g. "box01"); subsequent boxes are
-                # spawned by ConveyorScript via /cargo/<conv>/spawn_cmd.
+                # No initial box is spawned at startup -- boxes arrive
+                # exclusively via /cargo/<conv>/spawn_cmd. We still parse
+                # test_box_position/size/mass from customData because the
+                # ScriptNode uses those values when it spawns each new box
+                # at runtime (one per spawn_cmd payload).
                 box_prim_path = None
                 initial_box_id = "box01"
                 spawn_pos = (0.0, 0.0, 0.0)
@@ -571,34 +531,13 @@ if not args.no_ros2:
                     if bp is None:
                         print(f"[run_sim] [conveyor {conv.GetName()}] "
                               f"test_box_enabled but test_box_position missing; "
-                              f"skipping box spawn")
+                              f"using default spawn pose (0,0,0)")
                     else:
-                        try:
-                            from isaacsim.core.api.objects import DynamicCuboid
-                            import numpy as np
-                            spawn_pos = (
-                                float(bp[0]), float(bp[1]), float(bp[2])
-                            )
-                            spawn_size = float(cd.get("test_box_size", 0.3))
-                            spawn_mass = float(cd.get("test_box_mass", 5.0))
-                            box_prim_path = (
-                                f"/World/CargoBoxes/{initial_box_id}"
-                            )
-                            DynamicCuboid(
-                                prim_path=box_prim_path,
-                                position=np.array(list(spawn_pos)),
-                                size=spawn_size,
-                                mass=spawn_mass,
-                                color=np.array([0.85, 0.55, 0.10]),
-                            )
-                            print(f"[run_sim] [conveyor {conv.GetName()}] "
-                                  f"spawned cargo box {initial_box_id} at "
-                                  f"{box_prim_path}  pos=({spawn_pos[0]:.2f},"
-                                  f"{spawn_pos[1]:.2f},{spawn_pos[2]:.2f})")
-                        except Exception as exc:
-                            print(f"[run_sim] [conveyor {conv.GetName()}] "
-                                  f"DynamicCuboid spawn failed: {exc}")
-                            box_prim_path = None
+                        spawn_pos = (
+                            float(bp[0]), float(bp[1]), float(bp[2])
+                        )
+                        spawn_size = float(cd.get("test_box_size", 0.3))
+                        spawn_mass = float(cd.get("test_box_mass", 5.0))
 
                 limit_axis = (
                     cd.get("limit_switch_axis")
@@ -689,6 +628,12 @@ if not args.no_ros2:
                 else:
                     rollers_prim_path = ""
 
+                # default_speed: belt auto-runs at this speed on startup.
+                # Once /conveyor/<id>/speed_cmd publishes any non-zero value
+                # the ScriptNode switches to honouring sub.get() literally
+                # (so a subsequent 0.0 publish stops the belt).
+                default_speed = float(cd.get("default_speed", 0.0))
+
                 # Conveyors, like doors, are shared infrastructure; keep the
                 # ROS2 namespace empty so any robot in the scene can drive the
                 # same /conveyor/<id>/speed_cmd topic.
@@ -704,6 +649,7 @@ if not args.no_ros2:
                     limit_axis=limit_axis,
                     limit_threshold=limit_thr,
                     limit_comparator=limit_cmp,
+                    default_speed=default_speed,
                     pickup_enabled=pickup_enabled,
                     pickup_candidates=pickup_candidates,
                     pickup_dock_xy=pickup_dock_xy,
@@ -740,184 +686,8 @@ if not args.no_ros2:
 
 omni.timeline.get_timeline_interface().play()
 
-
-def _find_articulation_root(stage, robot_path: str) -> str:
-    """Return the first prim under `robot_path` (inclusive) that has
-    `UsdPhysics.ArticulationRootAPI` applied. Falls back to `robot_path`
-    itself so callers still get a usable string in the odd case where the
-    API isn't found (Isaac Sim will then raise its own clearer error).
-    """
-    from pxr import Usd, UsdPhysics
-
-    root = stage.GetPrimAtPath(robot_path)
-    if not root.IsValid():
-        return robot_path
-    for prim in Usd.PrimRange(root):
-        if prim.HasAPI(UsdPhysics.ArticulationRootAPI):
-            return str(prim.GetPath())
-    return robot_path
-
-
-def _pose_probe_factory(robot_path: str):
-    """Return a no-arg callable that prints the base_link world pose plus
-    per-wheel joint velocity. Lazily resolves prims because the articulation
-    wakes up a few ticks after `.play()`.
-    """
-    from pxr import Gf, Usd, UsdGeom
-    import math
-
-    base_link_path = f"{robot_path}/base_link"
-    state = {
-        "prim": None,
-        "last_pos": None,
-        "last_t": None,
-        "art_view": None,
-        "wl_idx": None,
-        "wr_idx": None,
-    }
-
-    def _resolve_joint_velocity_source(stage_):
-        """Lazy-build an ArticulationView keyed on the robot's root path so we
-        can read PhysX joint velocities directly (bypasses /joint_states lag).
-        Returns (art, left_idx, right_idx) or (None, None, None) on failure.
-        """
-        try:
-            from isaacsim.core.prims import Articulation
-        except Exception:
-            return None, None, None
-        try:
-            # `isaacsim.core.prims.Articulation` requires the pattern to match
-            # a prim with both RigidBodyAPI and ArticulationRootAPI. MirAMR
-            # puts ArticulationRootAPI on `base_link`, not on the
-            # `/World/<Robot>` Xform, so we descend explicitly.
-            art_root_path = _find_articulation_root(stage_, robot_path)
-            art = Articulation(prim_paths_expr=art_root_path)
-            # `initialize` binds the view to the live PhysX articulation; it
-            # only works once the sim has been played for >=1 step, so we wrap
-            # in try/except and retry later if it's not yet ready.
-            art.initialize()
-        except Exception as exc:
-            if state.get("logged_art_err") != str(exc):
-                print(f"[pose] articulation not ready: {exc}")
-                state["logged_art_err"] = str(exc)
-            return None, None, None
-        names = list(art.dof_names)
-        try:
-            return art, names.index("drivewhl_l_joint"), names.index("drivewhl_r_joint")
-        except ValueError:
-            print(f"[pose] wheel dofs not found in {names}")
-            return None, None, None
-
-    def _probe():
-        import time as _time
-        stage_ = omni.usd.get_context().get_stage()
-        if state["prim"] is None or not state["prim"].IsValid():
-            state["prim"] = stage_.GetPrimAtPath(base_link_path)
-            if not state["prim"].IsValid():
-                print(f"[pose] {base_link_path} not found yet")
-                return
-        if state["art_view"] is None:
-            art, wl, wr = _resolve_joint_velocity_source(stage_)
-            if art is not None:
-                state["art_view"] = art
-                state["wl_idx"], state["wr_idx"] = wl, wr
-        xf = UsdGeom.Xformable(state["prim"]).ComputeLocalToWorldTransform(
-            Usd.TimeCode.Default()
-        )
-        pos = xf.ExtractTranslation()
-        m = Gf.Matrix3d(xf.ExtractRotationMatrix())
-        sy = math.sqrt(m[0][0] ** 2 + m[1][0] ** 2)
-        if sy > 1e-6:
-            roll = math.atan2(m[2][1], m[2][2])
-            pitch = math.atan2(-m[2][0], sy)
-            yaw = math.atan2(m[1][0], m[0][0])
-        else:
-            roll = math.atan2(-m[1][2], m[1][1])
-            pitch = math.atan2(-m[2][0], sy)
-            yaw = 0.0
-        now = _time.time()
-        lin = ""
-        if state["last_pos"] is not None:
-            dt = now - state["last_t"]
-            if dt > 0:
-                dx = pos[0] - state["last_pos"][0]
-                dy = pos[1] - state["last_pos"][1]
-                dz = pos[2] - state["last_pos"][2]
-                lin = f"  v=({dx/dt:+.3f},{dy/dt:+.3f},{dz/dt:+.3f})m/s"
-        state["last_pos"] = (pos[0], pos[1], pos[2])
-        state["last_t"] = now
-        wheels = ""
-        phys = ""
-        art = state["art_view"]
-        if art is not None:
-            try:
-                vels = art.get_joint_velocities()
-                wl_v = float(vels[0, state["wl_idx"]])
-                wr_v = float(vels[0, state["wr_idx"]])
-                wheels = f"  wheels=(L{wl_v:+.2f},R{wr_v:+.2f})rad/s"
-            except Exception as exc:
-                wheels = f"  wheels=<err:{exc}>"
-            # Read the articulation root's PhysX world pose directly. This
-            # bypasses any USD-staleness / Fabric-writeback issues and tells
-            # us definitively whether PhysX is actually translating the base.
-            try:
-                positions, _ = art.get_world_poses()
-                px, py, pz = float(positions[0, 0]), float(positions[0, 1]), float(positions[0, 2])
-                phys = f"  phys=({px:+.3f},{py:+.3f},{pz:+.3f})"
-            except Exception as exc:
-                phys = f"  phys=<err:{exc}>"
-        print(
-            f"[pose] xyz=({pos[0]:+.3f},{pos[1]:+.3f},{pos[2]:+.3f}) "
-            f"rpy=({math.degrees(roll):+.1f},{math.degrees(pitch):+.1f},"
-            f"{math.degrees(yaw):+.1f})deg{lin}{wheels}{phys}"
-        )
-
-    return _probe
-
-
-pose_probe = _pose_probe_factory(_pose_robot["robot_path"]) if args.debug_pose else None
-
 try:
-    import math as _math
-    import time
-    next_cmdvel_debug = time.time() + 2.0
-    next_pose = time.time() + 0.5
-    # Track peak |pitch| between `[pose]` prints so we catch transients that
-    # would otherwise fall between 0.5s samples. Reset after each print.
-    peak_pitch = {"max": 0.0, "min": 0.0}
-    last_peak_reset = time.time()
     while simulation_app.is_running():
         simulation_app.update()
-        now = time.time()
-        if args.debug_cmdvel and not args.no_cmdvel and now >= next_cmdvel_debug:
-            print_cmd_vel_snapshot()
-            next_cmdvel_debug = now + 2.0
-        if pose_probe is not None:
-            # Fast peak sampling every frame (no printing), so transient pitch
-            # peaks during cmd_vel transitions aren't missed between the 0.5s
-            # human-readable lines below.
-            try:
-                from pxr import Gf, Usd, UsdGeom
-                import omni.usd
-                _stage = omni.usd.get_context().get_stage()
-                _bl = _stage.GetPrimAtPath(f"{_pose_robot['robot_path']}/base_link")
-                if _bl and _bl.IsValid():
-                    _xf = UsdGeom.Xformable(_bl).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
-                    _m = Gf.Matrix3d(_xf.ExtractRotationMatrix())
-                    _sy = _math.sqrt(_m[0][0] ** 2 + _m[1][0] ** 2)
-                    _pitch_deg = _math.degrees(_math.atan2(-_m[2][0], _sy))
-                    if _pitch_deg > peak_pitch["max"]:
-                        peak_pitch["max"] = _pitch_deg
-                    if _pitch_deg < peak_pitch["min"]:
-                        peak_pitch["min"] = _pitch_deg
-            except Exception:
-                pass
-            if now >= next_pose:
-                print(f"[pose_peak_since_prev] pitch in "
-                      f"[{peak_pitch['min']:+.2f}, {peak_pitch['max']:+.2f}] deg")
-                peak_pitch["max"] = 0.0
-                peak_pitch["min"] = 0.0
-                pose_probe()
-                next_pose = now + 0.5
 finally:
     simulation_app.close()
