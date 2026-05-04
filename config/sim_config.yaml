@@ -30,14 +30,14 @@ robots:
   #                      keeps chassis:wheel ratio near 50:1 (PhysX stable).
   - enabled: true
     model: "mir250"
-    robot_name: "MirAMR_01"
+    robot_name: "SyncRobot01"
     namespace: "robot01"
     spawn_position: [0.0, 0.0, 0.14]
     scale: 0.7
     lidar_layout: "dual_diagonal"
   - enabled: true
     model: "mir250"
-    robot_name: "MirAMR_02"
+    robot_name: "SyncRobot02"
     namespace: "robot02"
     spawn_position: [0.0, 5.0, 0.14]
     scale: 0.7
@@ -72,6 +72,133 @@ charging_stations:
     position: [1.6, 12.5, 0.0]      # world XYZ of dock base centre at floor
     rotation_z_deg: -90.0            # -90 deg yaw (-1.57 rad); faceplate normal points -Y
     # approach_pad: true             # default; set false to omit the floor plate
+
+conveyors:
+  # Isaac Sim 5.1 ConveyorBelt assets, referenced from a local copy of
+  # NVIDIA's public asset bucket (download with `tools/fetch_isaac_conveyor.py`).
+  # Each entry becomes /World/Conveyors/<id> with the asset's defaultPrim
+  # subtree composed in via reference. Geometry, materials and colliders
+  # come from the Isaac USD; we only own placement + customData.
+  #
+  # Per-entry keys (see src/syncai_omniverse/usd/conveyor.py for full doc):
+  #   id (required)        : prim name + ROS2 topic key
+  #   usd_path (required)  : repo-root-relative path to the conveyor USD
+  #   position             : [x, y, z] world XYZ; conveyor's local origin
+  #                          (Isaac authors the bottom near z=0 -- a small z>0
+  #                          lift avoids z-fighting with the warehouse ground).
+  #   rotation_z_deg       : yaw in degrees (0 = belt aligned with world +X)
+  #   scale                : uniform scale factor (default 1.0)
+  #   belt_surface_prim    : (optional) belt mesh prim under the wrapper to
+  #                          target with surface velocity at runtime; default
+  #                          "<wrapper>/Belt" is a placeholder -- override
+  #                          per-variant when wiring belt motion later.
+  #   ros2_speed_topic / ros2_status_topic : optional topic overrides
+  - name: "Conveyor01"
+    id: "conveyor_01"
+    usd_path: "assets/usd/conveyors/ConveyorBelt_A08.usd"
+    # East-wall loading station: belt runs north-south along world Y.
+    # A08 is 2.72 m long x 1.15 m wide; with rot=90 the belt occupies
+    # world X=[5.93, 7.08], Y=[-5.72, -3.00] -- ~1.2 m from the +X wall,
+    # ~8 m from EastDoor, clear of both robots' spawn area.
+    position: [-2.0, 10.0, 0.05]
+    rotation_z_deg: 90.0
+    scale: 1.0
+    # ConveyorBelt_A08's belt mesh is SM_ConveyorBelt_A08_02 (the prim name
+    # varies per Isaac variant). Pinned here so the runtime IsaacConveyor
+    # node knows which surface to drive when belt motion is wired up.
+    belt_surface_prim: "/World/Conveyors/conveyor_01/SM_ConveyorBelt_A08_02"
+    # `direction` is in the surface actor's LOCAL frame, not world (PhysX
+    # PhysxSurfaceVelocityAPI:surfaceVelocity is local-frame). Cargo rests
+    # on the kinematic Rollers body whose local frame is rotated by the
+    # wrapper's `rotation_z_deg=90`, so Rollers-local -X maps to world -Y
+    # -- the direction we want cargo to travel.
+    direction: [-1.0, 0.0, 0.0]
+    # Belt auto-runs at this surface speed (m/s) on sim startup. Once
+    # /conveyor/conveyor_01/speed_cmd publishes any non-zero value the
+    # ScriptNode switches to honouring sub.get() literally (so a
+    # subsequent 0.0 publish stops the belt).
+    default_speed: 1.0
+
+    # Default spawn pose / size / mass for every box created via
+    # /cargo/conveyor_01/spawn_cmd. With the conveyor at position [-2, 10]
+    # rotated 90 deg, the belt occupies world X=[-2.58, -1.42],
+    # Y=[7.28, 10.00], Z=[0.05, 1.22]. Spawn near the +Y tail (Y=10) and
+    # ~0.2 m above the belt top so the box has the full ~2 m run to
+    # travel toward -Y before the limit switch fires.
+    # `enabled: true` was historically the toggle for run_sim.py's auto-
+    # spawn-on-startup. After the request-driven refactor it just gates
+    # whether these spawn parameters get baked into customData; leave it
+    # true so spawn_cmd uses the configured pose.
+    test_box:
+      enabled: true
+      size: 0.3
+      mass: 5.0
+      position: [-2.0, 9.5, 1.45]
+
+    # Limit switch is a soft gate inside the runtime ScriptNode: when
+    # `comparator(box.world_pos[axis], threshold)` is true, effective speed
+    # is pinned to 0 and `/status` publishes "limit_triggered"; when the
+    # box moves back across the threshold the commanded speed resumes.
+    # comparator: "ge" (>=) or "le" (<=). With direction=-Y we want the
+    # gate to fire as the box approaches the -Y head end (Y_min=7.28),
+    # so use "le" with threshold 0.27 m short of the edge.
+    limit_switch:
+      enabled: true
+      axis: "y"
+      comparator: "le"
+      threshold: 7.55
+
+    # AMR pickup zone. While limit_switch is firing, if any candidate
+    # robot's base_link XY is within `dock_radius` of `dock_pose`, the
+    # cargo box is switched to kinematic and pose-locked to that robot's
+    # base_link with `attach_local_offset` (in base_link local frame).
+    # Drop-off is out of scope: once carried, the box stays carried until
+    # the sim restarts.
+    pickup_target:
+      enabled: true
+      candidate_robots:
+        - "/World/SyncRobot01"
+        - "/World/SyncRobot02"
+      # World-XY of dock spot, just downstream of limit switch (~Y=7.05).
+      dock_pose: [-2.0, 7.05]
+      dock_radius: 0.6              # generous; tighten when nav2 docks well
+      # base_link-local offset for box rest pose. Tune empirically:
+      # plate top sits ~0.22 m above base_link origin (post-scale), then
+      # add ~half the box (0.15) so it visually sits on the plate.
+      attach_local_offset: [0.0, 0.0, 0.30]
+      follow_yaw: true              # box rotates with robot
+
+drop_zones:
+  # Named destinations the external task planner can drop cargo at via
+  # /cargo/drop_cmd (std_msgs/String, payload = drop-zone id). Pure
+  # registry; no visual geometry is authored. When ConveyorScript sees a
+  # drop_cmd whose payload matches an id here AND the carrying robot's
+  # base_link XY is within `radius` of `position`, it switches the cargo
+  # box back to dynamic (gravity-on) at its current pose. An empty payload
+  # or "any" skips the zone radius check (debug bypass).
+  - id: "dropoff_a"
+    # Rectangle 2.8m x 2.0m centred at world (5.85, -0.29). Map-frame
+    # corners (3.0,-2.0)/(5.8,-2.0)/(5.8,-4.0)/(3.0,-4.0) under the
+    # nav2 calibration (map = world + (-1.45, -2.71)) become the world
+    # corners listed in `boundary` below.
+    position: [5.85, -0.29]         # zone centre (XY) used for radius check
+    # 2.0 lets the robot stand at the staging point world (5.95, 1.36)
+    # (= map (4.5, -1.35), just north of the drop area) and still pass
+    # the in-zone check before "throwing" the box into the centre.
+    # Distance staging->centre is ~1.65 m.
+    radius: 2.0
+    # World pose where the box is teleported the moment its joint is
+    # removed. Box then falls from drop_pose.z under gravity. If omitted,
+    # defaults to [position.x, position.y, 0.5].
+    drop_pose: [5.85, -0.29, 1.0]
+    # Visual-only ground outline for the drop area. 4 world-XY corners,
+    # in order (the builder closes the loop). Pure cosmetic -- the radius
+    # check still uses position+radius, not this boundary.
+    boundary:
+      - [4.45,  0.71]
+      - [7.25,  0.71]
+      - [7.25, -1.29]
+      - [4.45, -1.29]
 
 output:
   scene_path: "scenes/dp1f_mir.usda"
